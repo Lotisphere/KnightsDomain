@@ -1,0 +1,14 @@
+Knights' Domain - source code
+Copyright (c) 2026 Mangolotis. All rights reserved.
+
+You may read this source code, and build it for your own use to play
+Queen's Domain. You may share links to this repository.
+
+Redistributing the source code or builds made from it, modifying it, or
+including it in other projects requires written permission from Mangolotis.
+
+The libraries in the vendor folder belong to their authors and are covered by
+their own licences, which are included in each library's folder or stated at
+the top of its files.
+
+Queen's Domain and its assets belong to their respective owners.
