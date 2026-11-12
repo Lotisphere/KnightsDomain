@@ -1,19 +1,19 @@
 {
-  "version": "1.0.3",
+  "version": "1.0.4",
   "files": [
     {
       "path": "KnightsDomain/KnightsDomain.dll",
-      "sha256": "5e7b404f5605fab2e01c6a42d15730e3353fd4b0e3d157be072e07b12807549c",
-      "size": 1715712,
-      "github": "https://github.com/Lotisphere/KnightsDomain/releases/download/v1.0.3/KnightsDomain.dll",
-      "mirror": "https://kd.mangolotis.com/update/1.0.3/KnightsDomain.dll"
+      "sha256": "23df9ef5e1f19f40394f82d217c452120bdc7773f5066a512585ede99e58504e",
+      "size": 1720832,
+      "github": "https://github.com/Lotisphere/KnightsDomain/releases/download/v1.0.4/KnightsDomain.dll",
+      "mirror": "https://kd.mangolotis.com/update/1.0.4/KnightsDomain.dll"
     },
     {
       "path": "xinput1_3.dll",
       "sha256": "c3415f62f31b1c033b80d7acb36ec15a755e3380d002c62e95b78ff8e6709dc1",
       "size": 140288,
-      "github": "https://github.com/Lotisphere/KnightsDomain/releases/download/v1.0.3/xinput1_3.dll",
-      "mirror": "https://kd.mangolotis.com/update/1.0.3/xinput1_3.dll"
+      "github": "https://github.com/Lotisphere/KnightsDomain/releases/download/v1.0.4/xinput1_3.dll",
+      "mirror": "https://kd.mangolotis.com/update/1.0.4/xinput1_3.dll"
     }
   ]
 }
