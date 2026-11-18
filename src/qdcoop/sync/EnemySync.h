@@ -49,6 +49,11 @@ uint16_t LocalAreaId();
 // All actors of `cls` (and subclasses) in the gameplay world. Uses UGameplayStatics::GetAllActorsOfClass with a
 // preallocated buffer, so no engine memory is leaked per call.
 void ActorsOfClass(SDK::UClass* cls, std::vector<SDK::AActor*>& out);
+// Enemy id of a live enemy actor (0 = not a registered enemy), the live actor of an id (nullptr = not here), and
+// whether this machine runs that enemy's AI. Used by HazardSync.
+uint64_t     EnemyIdOfActor(const SDK::AActor* actor);
+SDK::AActor* EnemyActorOfId(uint64_t id);
+bool         EnemyOwnedHere(uint64_t id);
 
 #if QD_DEV
 // ---- test tooling (dev flavour only; debug/DevCommands.cpp). `filter` = case-insensitive part of the enemy's class or

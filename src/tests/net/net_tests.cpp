@@ -311,7 +311,7 @@ void TestRoundTrips() {
     notify.flags = kDamageHitNotifyOnly;
     RoundTrip("DamageRequest(notify)", notify, MsgType::DamageRequest);
 
-    CHECK(kProtocolVersion == 5);   // v5: EnemyBlob / Interacted
+    CHECK(kProtocolVersion == 6);   // v6: WorldFlags in use, Hazard
     CHECK(static_cast<uint8_t>(MsgType::EnemyOwner) == 45);
     MsgEnemyOwner eo;
     eo.enemyId = 0x0123456789ABCDEFull;
@@ -350,6 +350,33 @@ void TestRoundTrips() {
     su.yaw = 90.f;
     su.areaName = "300_LIB";
     RoundTrip("Summon", su, MsgType::Summon);
+    {
+        MsgHazard hz;
+        hz.enemyId = 0x1122334455667788ull;
+        hz.ownerSlot = 2;
+        hz.flags = 5;
+        hz.classPath = "/Game/Enemies/Mossy/Mossy_Arrow_Projectile.Mossy_Arrow_Projectile_C";
+        hz.pos = {1, 2, 3};
+        hz.rot = {4, 5, 6};
+        hz.scale = {1, 1, 2};
+        hz.layout = 0xABCD1234;
+        hz.vars = {1, 0, 7, 255};
+        hz.guid = {9, 8, 7, 6};
+        const auto bytes = Encode(hz);
+        MsgHazard back;
+        CHECK(PeekType(bytes.data(), bytes.size()) == MsgType::Hazard);
+        CHECK(Decode(bytes.data(), bytes.size(), back));
+        CHECK(back.enemyId == hz.enemyId && back.ownerSlot == 2 && back.flags == 5 && back.classPath == hz.classPath);
+        CHECK(back.pos.z == 3 && back.rot.y == 5 && back.scale.z == 2 && back.layout == hz.layout);
+        CHECK(back.vars == hz.vars && back.guid == hz.guid);
+        CHECK(!Decode(bytes.data(), bytes.size() - 1, back));
+        MsgWorldFlags wf;
+        wf.full = true;
+        wf.flags = {{"g0123456789ABCDEF0123456789ABCDEF", 1}, {"nTotalChestsOpened", 3}};
+        const auto wb = Encode(wf);
+        MsgWorldFlags wback;
+        CHECK(Decode(wb.data(), wb.size(), wback) && wback.full && wback.flags.size() == 2 && wback.flags[1].value == 3);
+    }
 
     // Range checks.
     {

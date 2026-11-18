@@ -3376,6 +3376,20 @@ uint16_t LocalAreaId() {
     return s.areaId;
 }
 
+uint64_t EnemyIdOfActor(const SDK::AActor* actor) {
+    auto& s = S();
+    if (auto it = s.byEnemy.find(actor); it != s.byEnemy.end()) return it->second;
+    if (auto it = s.spawnerIds.find(actor); it != s.spawnerIds.end()) return it->second;   // loot dropped by a spawner
+    return 0;
+}
+SDK::AActor* EnemyActorOfId(uint64_t id) {
+    auto& s = S();
+    auto it = s.entries.find(id);
+    if (it == s.entries.end() || !Valid(it->second.enemy)) return nullptr;
+    return it->second.enemy;
+}
+bool EnemyOwnedHere(uint64_t id) { return IsMine(id); }
+
 void ActorsOfClass(SDK::UClass* cls, std::vector<SDK::AActor*>& out) {
     out.clear();
     SDK::UWorld* world = ue::World();

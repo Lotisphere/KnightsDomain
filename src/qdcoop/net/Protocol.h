@@ -8,7 +8,7 @@
 
 namespace qd::net {
 
-constexpr uint16_t kProtocolVersion = 5;   // v5: EnemyBlob, EnemyEvent Interacted (v4: Woke/CustomAttack, EnemyState flag bit4)
+constexpr uint16_t kProtocolVersion = 6;   // v6: WorldFlags in use, Hazard; v5: EnemyBlob, EnemyEvent Interacted (v4: Woke/CustomAttack, EnemyState flag bit4)
 constexpr int      kMaxPlayers = 4;
 constexpr size_t   kMaxNameBytes = 72;    // UTF-8, 24 CJK chars
 constexpr size_t   kMaxItemPathBytes = 256;   // MsgEquip::itemPath
@@ -17,7 +17,7 @@ enum class MsgType : uint8_t {
     Hello = 1, Welcome, Reject, PeerJoined, PeerLeft, NameChanged,
     PlayerState = 20, PlayerEvent, Equip = 22,
     EnemyStates = 40, EnemyEvent, DamageRequest, EnemyOwner = 45, EnemyBlob = 46, EnemyMontage = 47,
-    WorldFlags = 60, InteractRequest, InteractResult, HpScale, Summon,
+    WorldFlags = 60, InteractRequest, InteractResult, HpScale, Summon, Hazard = 65,
     Heartbeat = 250,   // consumed by Session
 };
 
@@ -123,6 +123,20 @@ enum class InteractOutcome : uint8_t { Allowed = 1, Denied, DoneByHost };
 struct MsgInteractResult  { uint32_t requestId = 0; InteractOutcome outcome = InteractOutcome::Denied; };
 struct MsgHpScale         { float normal = 1, elite = 1, boss = 1; uint8_t playerCount = 1; };
 struct MsgSummon          { Vec3f pos; float yaw = 0; std::string areaName; };
+// the owner's copy of an enemy spawned a projectile / area attack actor (arrow, fireball, puddle ...). Followers spawn
+// the same class at the same place with their copy of the enemy as instigator, so it shows and hurts on every
+// machine. rot = pitch, yaw, roll in degrees. Reliable; host relays.
+constexpr size_t kMaxClassPathBytes = 220;
+// flags: bit0 the enemy is the actor's Owner, bit1 the enemy is its Instigator, bit2 a loot drop of the enemy (the
+// owner rolled it; the others skip their own roll and spawn this one with the same save GUID, so it is picked up once). vars = the actor's plain Blueprint
+// variables as the owner's copy had them right after spawning (layout = hash of their names and sizes; ignored on a
+// mismatch); an object variable that pointed at the enemy travels as one byte and is pointed at the local copy.
+constexpr size_t kMaxHazardVarBytes = 600;
+struct MsgHazard {
+    uint64_t enemyId = 0; uint8_t ownerSlot = 0; uint8_t flags = 0; std::string classPath; Vec3f pos, rot, scale{1, 1, 1};
+    uint32_t layout = 0; std::vector<uint8_t> vars;
+    std::array<uint32_t, 4> guid{};   // drops: GUIDs[0] of the pickup on the owner's copy
+};
 
 // ---- codec ----
 MsgType PeekType(const uint8_t* data, size_t size);   // returns (MsgType)0 if size == 0
@@ -136,7 +150,7 @@ bool PeekHelloProtocol(const uint8_t* data, size_t size, uint16_t& protocol);
 QD_MSG(MsgHello) QD_MSG(MsgReject) QD_MSG(MsgWelcome) QD_MSG(MsgPeerJoined) QD_MSG(MsgPeerLeft) QD_MSG(MsgNameChanged)
 QD_MSG(MsgPlayerState) QD_MSG(MsgPlayerEvent) QD_MSG(MsgEquip)
 QD_MSG(MsgEnemyStates) QD_MSG(MsgEnemyEvent) QD_MSG(MsgDamageRequest) QD_MSG(MsgEnemyOwner) QD_MSG(MsgEnemyBlob) QD_MSG(MsgEnemyMontage)
-QD_MSG(MsgWorldFlags) QD_MSG(MsgInteractRequest) QD_MSG(MsgInteractResult) QD_MSG(MsgHpScale) QD_MSG(MsgSummon)
+QD_MSG(MsgWorldFlags) QD_MSG(MsgInteractRequest) QD_MSG(MsgInteractResult) QD_MSG(MsgHpScale) QD_MSG(MsgSummon) QD_MSG(MsgHazard)
 #undef QD_MSG
 
 // Splits a large enemy snapshot into several complete MsgEnemyStates messages, each <= maxBytes when encoded

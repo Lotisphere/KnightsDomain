@@ -9,6 +9,7 @@
 #include "qdcoop/sync/PlayerSync.h"
 
 #include "qdcoop/core/Core.h"
+#include "qdcoop/core/Guard.h"
 #include "qdcoop/core/Log.h"
 #include "qdcoop/core/Unreal.h"
 #include "qdcoop/sync/Coop.h"
@@ -636,7 +637,21 @@ void PlayerSyncInit() {
         if (prev) prev();
         ClearAllRemotes();
     };
-    s.ticker = gamethread::AddTicker("playersync", [](float dt) { Tick(dt); });
+    // A structured exception inside the tick (seen right after a death reload, when the game thread had stalled and
+    // the old world's actors were already gone) used to remove the ticker for the rest of the run, leaving every
+    // player invisible. It is caught here instead: the puppets are dropped without being touched and rebuilt from
+    // the next snapshots.
+    s.ticker = gamethread::AddTicker("playersync", [](float dt) {
+        const auto r = detail::GuardedCall(kTag, "tick", [&] { Tick(dt); });
+        if (r != detail::GuardResult::SehException) return;
+        auto& st = S();
+        for (auto& rem : st.remotes)
+            if (rem.puppet) rem.puppet->Abandon(), rem.puppet.reset();
+        if (st.dummy) st.dummy->Abandon(), st.dummy.reset();
+        st.world = nullptr;
+        st.halfHeightKnown = false;
+        QD_WARN(kTag, "tick failed; puppets dropped and rebuilt");
+    });
     QD_INFO(kTag, "initialized");
 }
 

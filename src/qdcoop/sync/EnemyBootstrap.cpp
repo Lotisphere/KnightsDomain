@@ -5,8 +5,10 @@
 #include "qdcoop/core/Core.h"
 #include "qdcoop/core/Log.h"
 #include "qdcoop/sync/EnemySync.h"
+#include "qdcoop/sync/HazardSync.h"
 #include "qdcoop/sync/Rules.h"
 #include "qdcoop/sync/Summon.h"
+#include "qdcoop/sync/WorldSync.h"
 
 namespace qd::sync {
 namespace {
@@ -15,6 +17,8 @@ void StartWo4Modules() {
     RulesInit();
     EnemySyncInit();
     SummonInit();
+    WorldSyncInit();
+    HazardSyncInit();
     QD_INFO("bootstrap", "enemy modules ready (rules, enemy sync, summon)");
 }
 
