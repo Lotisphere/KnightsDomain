@@ -57,6 +57,14 @@ constexpr uint16_t kNoReturnValue = 0xFFFF;
 constexpr uintptr_t kKnownProcessInternalRva = 0x011A7E40;
 constexpr uintptr_t kKnownProcessLocalScriptFunctionRva = 0x011A7F50;
 
+// Game updates move both functions (+0x6F0 between the two builds seen so far) but keep ProcessLocalScriptFunction a
+// little after ProcessInternal, so it is found by its prologue in the 4 KB that follow ProcessInternal. The pattern
+// matches exactly once in the whole image of both builds. -1 = any byte (the RIP-relative security-cookie load).
+constexpr int16_t kPlsfPattern[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x20, 0x57, 0x48, 0x83, 0xEC, 0x70, 0x48, 0x8B, 0x05,
+    -1,   -1,   -1,   -1,   0x48, 0x33, 0xC4, 0x48, 0x89, 0x44, 0x24, 0x60, 0x48, 0x8B, 0x42, 0x20, 0x48, 0x8D, 0x35};
+constexpr size_t kPlsfSearchBytes = 0x1000;
+
 constexpr int      kMaxChainDepth = 16;
 constexpr int      kMaxLists = 8;
 constexpr uint64_t kResolveIntervalMs = 500;
@@ -635,6 +643,26 @@ bool CreateHook(void* target, void* detour, void** original, const char* name) {
 
 bool ScriptHooksComplete() { return g_plsfTarget != nullptr; }
 
+// The single place after ProcessInternal where kPlsfPattern matches; nullptr when there is none or more than one.
+void* FindProcessLocalScriptFunction(void* processInternal) {
+    const auto* from = static_cast<const uint8_t*>(processInternal);
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(from, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return nullptr;
+    const auto* regionEnd = static_cast<const uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+    const size_t n = std::size(kPlsfPattern);
+    const uint8_t* end = from + kPlsfSearchBytes;
+    if (end > regionEnd) end = regionEnd;
+    const uint8_t* found = nullptr;
+    for (const uint8_t* c = from + 16; c + n <= end; ++c) {
+        size_t i = 0;
+        while (i < n && (kPlsfPattern[i] < 0 || *(c + i) == static_cast<uint8_t>(kPlsfPattern[i]))) ++i;
+        if (i < n) continue;
+        if (found) return nullptr;   // ambiguous: better no hook than the wrong function
+        found = c;
+    }
+    return const_cast<uint8_t*>(found);
+}
+
 bool Init() {
     if (g_installed.load()) return true;
     const MH_STATUS init = MH_Initialize();
@@ -659,20 +687,25 @@ bool Init() {
     const uintptr_t base = ImageBase();
     if (util::CommandLineHasFlag(L"-qdcoop-noplsf")) {
         QD_WARN(kTag, "-qdcoop-noplsf: ProcessLocalScriptFunction not hooked; BP->BP calls will not dispatch");
-    } else if (reinterpret_cast<uintptr_t>(g_piTarget) == base + kKnownProcessInternalRva) {
-        g_plsfTarget = reinterpret_cast<void*>(base + kKnownProcessLocalScriptFunctionRva);
-        if (CreateHook(g_plsfTarget, reinterpret_cast<void*>(&Detour_ProcessLocalScriptFunction),
-                       reinterpret_cast<void**>(&o_ProcessLocalScriptFunction), "ProcessLocalScriptFunction")) {
-            QD_INFO(kTag, "ProcessLocalScriptFunction at {} (known build RVA 0x{:X})", g_plsfTarget,
-                    kKnownProcessLocalScriptFunctionRva);
+    } else {
+        const char* how = "prologue pattern after ProcessInternal";
+        g_plsfTarget = FindProcessLocalScriptFunction(g_piTarget);
+        if (!g_plsfTarget && reinterpret_cast<uintptr_t>(g_piTarget) == base + kKnownProcessInternalRva) {
+            g_plsfTarget = reinterpret_cast<void*>(base + kKnownProcessLocalScriptFunctionRva);
+            how = "known build RVA";
+        }
+        if (!g_plsfTarget) {
+            QD_WARN(kTag,
+                    "ProcessLocalScriptFunction not found after ProcessInternal (RVA 0x{:X}): unknown exe build, NOT "
+                    "hooked. Hooks on Blueprint functions will only fire when entered via ProcessEvent (not BP->BP calls).",
+                    reinterpret_cast<uintptr_t>(g_piTarget) - base);
+        } else if (CreateHook(g_plsfTarget, reinterpret_cast<void*>(&Detour_ProcessLocalScriptFunction),
+                              reinterpret_cast<void**>(&o_ProcessLocalScriptFunction), "ProcessLocalScriptFunction")) {
+            QD_INFO(kTag, "ProcessLocalScriptFunction at {} (RVA 0x{:X}, {})", g_plsfTarget,
+                    reinterpret_cast<uintptr_t>(g_plsfTarget) - base, how);
         } else {
             g_plsfTarget = nullptr;
         }
-    } else {
-        QD_WARN(kTag,
-                "ProcessInternal RVA 0x{:X} != known 0x{:X}: unknown exe build, ProcessLocalScriptFunction NOT hooked. "
-                "Hooks on Blueprint functions will only fire when entered via ProcessEvent (not BP->BP calls).",
-                reinterpret_cast<uintptr_t>(g_piTarget) - base, kKnownProcessInternalRva);
     }
 
     const MH_STATUS en = MH_EnableHook(MH_ALL_HOOKS);
@@ -691,13 +724,83 @@ bool Init() {
     return true;
 }
 
+// ------------------------------------------------------------------ native function posts
+constexpr size_t kFuncNative = 0xD8;   // UFunction::Func (see the layout note at the top)
+using NativeFn = void (*)(SDK::UObject* context, FFrame& stack, void* result);
+
+struct NativeSlot {
+    SDK::UFunction*    function = nullptr;
+    NativeFn           original = nullptr;
+    NativePostCallback cb;
+};
+NativeSlot g_native[kMaxNativePosts];
+
+template <int N>
+void NativeThunk(SDK::UObject* context, FFrame& stack, void* result) {
+    NativeSlot& slot = g_native[N];
+    slot.original(context, stack, result);
+    if (slot.cb && result && GetCurrentThreadId() == core::GameThreadId()) slot.cb(FrameObject(stack), FrameNode(stack), result);
+}
+constexpr NativeFn kNativeThunks[kMaxNativePosts] = {&NativeThunk<0>, &NativeThunk<1>, &NativeThunk<2>, &NativeThunk<3>};
+
+bool InGameImage(const void* p) {
+    const auto* base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    const auto* q = static_cast<const uint8_t*>(p);
+    return q >= base && q < base + nt->OptionalHeader.SizeOfImage;
+}
+
+void RestoreNativePosts() {
+    for (NativeSlot& slot : g_native) {
+        if (!slot.function || !slot.original) continue;
+        if (ue::IsValid(slot.function))
+            *reinterpret_cast<NativeFn*>(reinterpret_cast<uint8_t*>(slot.function) + kFuncNative) = slot.original;
+        slot = {};
+    }
+}
+
 void Shutdown() {
+    RestoreNativePosts();
     if (!g_installed.exchange(false)) return;
     if (g_maintTicker) gamethread::RemoveTicker(g_maintTicker);
     g_maintTicker = 0;
     // Disable only: trampolines may still be on some thread's stack, so MinHook is not uninitialized.
     MH_DisableHook(MH_ALL_HOOKS);
     QD_INFO(kTag, "hooks disabled");
+}
+
+bool AddNativePost(const char* functionPath, NativePostCallback cb) {
+    if (!functionPath || !cb) return false;
+    auto* fn = static_cast<SDK::UFunction*>(ue::FindObject(functionPath));
+    if (!fn || !ue::IsValid(fn)) {
+        QD_WARN(kTag, "native post: {} not found", functionPath);
+        return false;
+    }
+    NativeFn* entry = reinterpret_cast<NativeFn*>(reinterpret_cast<uint8_t*>(fn) + kFuncNative);
+    for (int i = 0; i < kMaxNativePosts; ++i) {
+        if (g_native[i].function == fn) {
+            g_native[i].cb = std::move(cb);
+            return true;
+        }
+    }
+    for (int i = 0; i < kMaxNativePosts; ++i) {
+        NativeSlot& slot = g_native[i];
+        if (slot.function) continue;
+        if (!*entry || !InGameImage(reinterpret_cast<const void*>(*entry))) {
+            QD_WARN(kTag, "native post: {} has no native entry inside the game image, not hooked", functionPath);
+            return false;
+        }
+        slot.function = fn;
+        slot.original = *entry;
+        slot.cb = std::move(cb);
+        *entry = kNativeThunks[i];
+        QD_INFO(kTag, "native post on {} (entry RVA 0x{:X})", functionPath,
+                reinterpret_cast<uintptr_t>(slot.original) - ImageBase());
+        return true;
+    }
+    QD_WARN(kTag, "native post: no free slot for {}", functionPath);
+    return false;
 }
 
 namespace {

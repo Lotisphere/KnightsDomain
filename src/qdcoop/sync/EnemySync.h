@@ -58,6 +58,7 @@ bool DebugEnemyGoto(const std::string& filter, float dist);     // teleport next
 void DebugEnemyHp(const std::string& filter, float fraction);   // owner only: HP = fraction x max
 void DebugEnemyHit(const std::string& filter, float damage);    // a hit by the local player (routed like a real one)
 void DebugEnemyWake(const std::string& filter);                 // ActivateTrap on our copy (like walking up to it)
+void DebugActorCount(const std::string& filter);                // actors whose class name contains the filter
 void DebugEnemyInteract(const std::string& filter);             // Interact(local player) on our copy
 #endif
 

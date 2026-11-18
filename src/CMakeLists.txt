@@ -28,6 +28,17 @@ add_compile_options(/utf-8 /MP /bigobj /permissive- /W3 /wd4244 /wd4267 /wd4018 
 add_link_options(/DEBUG /OPT:REF /OPT:ICF)   # PDBs for crash triage; not shipped
 add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
 
+# The mod looks the engine addresses up at run time (qdcoop/core/EngineOffsets.cpp) and writes them into the SDK's
+# Offsets table, so that table has to consist of variables. See "Building" in README.md.
+if (EXISTS ${QD_SDK}/SDK/Basic.hpp)
+    file(STRINGS ${QD_SDK}/SDK/Basic.hpp QD_SDK_CONST_OFFSETS REGEX "constexpr int32 GObjects")
+    if (QD_SDK_CONST_OFFSETS)
+        message(FATAL_ERROR "SDK/Basic.hpp still declares the Offsets as constexpr. Make them variables first: see \"Building\" in README.md.")
+    endif()
+else()
+    message(FATAL_ERROR "No SDK headers at ${QD_SDK}. Pass -DQD_SDK=<folder that contains SDK.hpp>.")
+endif()
+
 # ---------- third party ----------
 add_library(minhook STATIC
     ${QD_VENDOR}/minhook/src/buffer.c ${QD_VENDOR}/minhook/src/hook.c ${QD_VENDOR}/minhook/src/trampoline.c

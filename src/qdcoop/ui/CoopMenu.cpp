@@ -292,7 +292,7 @@ void DrawNotice() {
     ImGui::PushTextWrapPos(0.0f);
     ImGui::TextColored(kColWarn, "%s", TrF("notice.title", core::kModVersion).c_str());
     ImGui::TextUnformatted(Tr("notice.thanks"));
-    for (const char* key : {"notice.1", "notice.2", "notice.3", "notice.4", "notice.5", "notice.6"})
+    for (const char* key : {"notice.1", "notice.2", "notice.3", "notice.4"})
         ImGui::TextUnformatted(Tr(key));
     ImGui::PopTextWrapPos();
     ImGui::Spacing();

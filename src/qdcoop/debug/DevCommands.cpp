@@ -16,6 +16,7 @@
 
 #include "qdcoop/core/Config.h"
 #include "qdcoop/core/Core.h"
+#include "qdcoop/core/Hooks.h"
 #include "qdcoop/core/Log.h"
 #include "qdcoop/core/Unreal.h"
 #include "qdcoop/net/Protocol.h"
@@ -221,6 +222,10 @@ void Run(const std::string& line) {
     else if (cmd == "ehp") { std::string f; float fr = 0.5f; in >> f >> fr; qd::sync::DebugEnemyHp(f, fr); }
     else if (cmd == "ehit") { std::string f; float dmg = 10; in >> f >> dmg; qd::sync::DebugEnemyHit(f, dmg); }
     else if (cmd == "ewake") { std::string f; in >> f; qd::sync::DebugEnemyWake(f); }
+    else if (cmd == "trace") {   // trace <ClassName> [seconds]: log every distinct function called on objects of that class
+        std::string c; float sec = 20; in >> c >> sec; qd::hooks::TraceClass(c.c_str(), sec);
+    }
+    else if (cmd == "acount") { std::string f; in >> f; qd::sync::DebugActorCount(f); }
     else if (cmd == "einteract") { std::string f; in >> f; qd::sync::DebugEnemyInteract(f); }
     else if (cmd == "rva") {   // rva <Class path> : log ExecFunction RVAs of every UFunction of that class
         std::string cls; in >> cls;

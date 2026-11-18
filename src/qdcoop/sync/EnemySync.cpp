@@ -78,6 +78,8 @@ constexpr const char* kFnBossBarOff       = "/Game/Player/FS_PlayerChar.FS_Playe
 // Trap mode (EnemyBase.InTrapMode): skeletons lying in pieces, the Grave Guardian kneeling at its shrine. Only the
 // machine whose copy rises calls ActivateTrap, so the rise is shared (EnemyEvent Woke + EnemyState flag bit4).
 constexpr const char* kFnActivateTrap     = "/Game/Enemies/EnemyBase.EnemyBase_C:ActivateTrap";
+constexpr const char* kFnActivateEnemyAI  = "/Game/Enemies/EnemyBase.EnemyBase_C:ActivateEnemyAI";
+constexpr const char* kFnEnterTrapMode    = "/Game/Enemies/EnemyBase.EnemyBase_C:EnterTrapMode";
 // BP attack functions that play their own montage and drive their own hitboxes from montage callbacks. Replaying the
 // generic attack montage (PlayAttack) on a follower shows the swing but deals no damage, so the owner sends
 // CustomAttack(index) and followers run the same function on their copy. Index = position in this table (wire value).
@@ -145,11 +147,32 @@ constexpr double kOwnerSwitchSec   = 6.0;       // rule 4: min. time between two
 constexpr float  kNearAssignRange  = 3000.0f;   // cm: "nearest" only hands an enemy to a player within 30 m of it
 constexpr float  kNearMarginCm     = 800.0f;    // ... who is at least 8 m closer than the current owner
 constexpr float  kNearMarginRatio  = 0.7f;      // ... and at most 70 % of the current owner's distance
-constexpr double kHitSwitchMinSec  = 1.0;       // hits: floor between two changes
+constexpr double kHitSwitchMinSec  = 3.0;       // hits: floor between two changes
 // bosses / elites keep private Blueprint state per copy (phase counters, intro flags). Every hand-over risks a
 // repeated phase change, so they change owner rarely: a hit moves them at most every 12 s, proximity never while the
 // owner is alive and near.
 constexpr double kBossHitSwitchSec = 12.0;
+// 1.0.4: in two-player fights a boss still changed owner every ~25 s (each player's hits pulled it over), and every
+// change restarts its AI on another machine: skill cooldowns, timers and phase logic never ran to the end, so bosses
+// mostly did basic attacks and skipped phase changes. Once a boss / elite is fighting, it now stays with the machine
+// that runs it until that player dies, leaves or moves out of the arena.
+// 1.0.5: a hit only pulls an enemy away from an owner who is not fighting it (not engaged, far away, or no hit of
+// their own within kHitAggroSec). Before, every hit (and every tick of a damage-over-time effect) moved the enemy to
+// the hitter, so two players attacking one enemy passed it back and forth and its AI kept restarting.
+constexpr float  kOwnerFightRange  = 2500.0f;   // cm: beyond this the owner is not considered to be fighting it
+// 1.0.6: 45 m was the size of the test arena. The main Whaleking's arena is far larger, players there were often more
+// than 45 m from the boss, the lock was dropped and the boss changed machine ten times in 90 s.
+constexpr float  kBossLockRange    = 9000.0f;
+constexpr double kRiseWatchSec     = 5.0;       // a dormant enemy is watched this long after ActivateTrap for its rise
+// 1.0.6 boss targets. A locked boss runs on one machine, and there the game's "target player" is always that
+// machine's player, so bosses only ever fought their owner. The owner now picks the target among all players near
+// the boss by threat (damage dealt, fading with a 12 s half-life) and hands the game that player's avatar.
+constexpr double kThreatHalfLife   = 12.0;
+constexpr double kTargetMinSec     = 8.0;       // a target is kept at least this long
+constexpr float  kTargetSwitchRatio = 1.35f;    // ... and only lost to someone with 35 % more threat
+constexpr double kTargetIdleSec    = 14.0;      // nobody dealt damage this long -> the nearest player
+constexpr const char* kFnGetTargetPlayer = "/Script/QueensDomain.FS_EnemyCharacterBase:GetTargetPlayer";   // cm: the owner keeps a fighting boss while within 45 m of it
+constexpr double kBossInteractSec  = 30.0;      // a talk-to-start boss goes to the player who talked to it (this long)
 constexpr double kBlobInterval     = 1.0;       // owner: boss state blob cadence (only between attacks)
 constexpr double kBlobFreshSec     = 60.0;      // takeover: a stored blob older than this is not applied
 constexpr double kInteractNoticeSec = 8.0;      // at most one Interacted notice per enemy per 8 s
@@ -168,8 +191,11 @@ constexpr float  kMaxDamage        = 5000.0f;
 constexpr size_t kMaxTags          = 32;
 constexpr float  kShieldHp         = 1.0e9f;
 constexpr double kDeadGraceSec     = 1.0;       // owner says dead without a Died event yet -> wait, then Kill(NoRewards)
-constexpr double kAliveConfirmSec  = 0.5;       // owner must report "alive" this long before a client Force Respawns
-constexpr double kRespawnRetrySec  = 5.0;
+constexpr double kAliveConfirmSec  = 1.0;       // owner must report "alive" this long before a client Force Respawns
+constexpr double kRespawnRetrySec  = 2.5;
+constexpr double kNativeSpawnWaitSec = 2.0;     // client: the spawner's own attempt gets this long before we force it
+                                                // (tests: with the window open it still produced nothing in 11 s)
+constexpr double kDupCleanSec      = 30.0;      // client: a second copy appearing this soon after a force is removed
 constexpr double kKillRetrySec     = 2.0;
 constexpr double kSpawnerAllowSec  = 6.0;       // our own Force Respawn may chain into Respawn/RespawnEnemy/timers
 constexpr double kEntryStaleSec    = 5.0;
@@ -228,6 +254,23 @@ struct Entry {
     // ---- host: ownership inputs
     uint8_t lastHitSlot = 0xFF;
     double  lastHitAt = -100;
+    double  hitAt[net::kMaxPlayers] = {-100, -100, -100, -100};   // host: last hit per slot (1.0.5)
+    double  resetBlockLogAt = -100;                // last "reset to dormant not run" log line (1.0.6)
+    double  respawnSkipLogAt = -100;               // client: last "out of range" log line (1.0.5)
+    double  missingSince = -1, missingSeenAt = -100;   // client: how long our copy has been missing (1.0.5)
+    double  forcedAt = -100;                       // client: last Force Respawn of this spawner (1.0.5)
+    bool    savedAiDisabled = false;               // bIsAIDisabled of the copy when we started following it (1.0.5)
+    uint8_t bossLockSlot = 0xFF;                   // host: the fighting boss stays with this slot (1.0.4)
+    uint64_t pairLeader = 0;                       // host: the paired boss this one follows (0 = none) (1.0.6)
+    float   threat[net::kMaxPlayers] = {0, 0, 0, 0};   // owner: damage dealt per slot, fading (1.0.6)
+    double  threatAt = -100;                       // owner: last fade / last damage
+    double  threatHitAt = -100;
+    uint8_t targetSlot = 0xFF;                     // owner: who the boss fights (0xFF = not chosen yet)
+    uint8_t followTarget = 0xFF;                   // follower: who the owner's copy is attacking (1.0.6)
+    bool    hostRun = false;                       // host: bosses and dormant-type enemies stay on the host (1.0.6)
+    double  targetSince = -100;
+    uint8_t interactSlot = 0xFF;                   // host: who talked to it last
+    double  interactAt = -100;
     uint8_t excludeSlot = 0xFF;                    // owner that went silent: not "nearest" again until excludeUntil
     double  excludeUntil = 0;
     // ---- follower side (another machine owns the enemy)
@@ -332,6 +375,10 @@ struct State {
     SDK::UWorld* world = nullptr;
     bool    active = false;   // coop::InSession()
     bool    wakingLocal = false;       // inside our own ActivateTrap call (don't echo a Woke)
+    bool    callingBossBar = false;    // inside our own boss bar call (follower showing the owner's bar)
+    int     remoteTargets = 0;         // bosses we run whose target is another player (1.0.6)
+    SDK::ACharacter* proxy[net::kMaxPlayers] = {};   // invisible stand-in character per remote player (1.0.6)
+    bool    nativeTargetHooks = false;
     int     customDepth = 0;           // nesting of kCustomAttacks calls (only the outermost is sent)
     bool    replayingCustom = false;   // inside a follower replay of a custom attack
     bool    isHost = true;
@@ -375,6 +422,12 @@ struct State {
     double   startTime = 0;
     int      hookDepth = 0;   // >0 while one of our hook callbacks / message handlers runs (see HookScope)
 };
+struct Entry;
+void AddThreat(Entry& e, uint8_t slot, float damage);
+void ChooseBossTarget(Entry& e, SDK::AEnemyBase_C* en, double now);
+SDK::ACharacter* TargetProxy(uint8_t slot, bool create);
+void WakeOnHit(Entry& e, SDK::AEnemyBase_C* en);
+
 State& S() {
     static State s;
     return s;
@@ -787,7 +840,14 @@ bool ApplyBlob(SDK::AEnemyBase_C* en, const BlobLayout& l, const std::vector<uin
 }
 
 // The stored blob onto our copy; `why` goes to the log (takeover only — the periodic apply is silent).
+// 1.0.6: not applied any more. The blob copies every plain Blueprint variable of the owner's copy, and that includes
+// what that machine thinks about its own player ("is in my arena"). Copied to another machine, a Whaleking taken
+// over by a player standing in its arena decided nobody was there and sat down again ten seconds later (test). With
+// bosses run by the host, take-overs are rare, and a copy that has risen keeps its own state.
+constexpr bool kApplyBossBlob = false;
+
 bool ApplyStoredBlob(Entry& e, SDK::AEnemyBase_C* en, const char* why) {
+    if (!kApplyBossBlob) return false;
     if (e.blob.empty()) return false;
     const BlobLayout* l = BlobLayoutFor(en);
     if (!l || l->hash != e.blobLayout) return false;
@@ -884,10 +944,29 @@ void NotifyHpWidgets(SDK::AEnemyBase_C* en, float damage) {
 void ReleaseControl(Entry& e) {
     SDK::AEnemyBase_C* en = e.controlledEnemy;
     if (Valid(en) && !en->bDead) {
-        en->bIsAIDisabled = false;
+        // 1.0.5: the game itself keeps dormant enemies (kneeling Grave Guardian, bone piles, petrified statues, the
+        // meditating Whaleking) with their AI disabled. Handing such an enemy back with the AI switched on made it
+        // walk and attack in its dormant pose, without ever playing its rise. It gets back exactly what it had,
+        // unless it really rose while we followed it.
+        // 1.0.6: "AI disabled when we started following it" alone is not proof of a dormant enemy, and an enemy
+        // left with its AI off ignores all damage. Dormant now means: has not risen here, and either still in trap
+        // mode, or a boss that waits with its AI off (meditating Whaleking) whose fight has not begun on its owner.
+        bool ownerFighting = false;
+        if (!e.snaps.empty()) ownerFighting = (e.snaps.back().s.flags & (4 | 32 | 64)) != 0;
+        const bool waitingBoss = e.savedAiDisabled && IsBossLike(e, en) && !e.bossBar && !ownerFighting;
+        const bool dormant = e.wokenFor != en && (en->InTrapMode || waitingBoss);
+        en->bIsAIDisabled = dormant;
+        if (!dormant && e.savedAiDisabled) {
+            // dormant when we took it, risen since: start its AI the way the game does
+            S().wakingLocal = true;
+            uint8_t none[16]{};
+            Call(en, "ActivateEnemyAI", none);
+            S().wakingLocal = false;
+            en->bIsAIDisabled = false;
+        }
         if (SDK::UCharacterMovementComponent* cm = en->CharacterMovement; Valid(cm)) {
-            const SDK::EMovementMode m =
-                e.savedMoveMode == SDK::EMovementMode::MOVE_None ? SDK::EMovementMode::MOVE_Walking : e.savedMoveMode;
+            SDK::EMovementMode m = e.savedMoveMode;
+            if (!dormant && m == SDK::EMovementMode::MOVE_None) m = SDK::EMovementMode::MOVE_Walking;
             cm->SetMovementMode(m, 0);
         }
     }
@@ -903,6 +982,7 @@ void TakeControl(Entry& e, SDK::AEnemyBase_C* en) {
         e.controlled = true;
         e.controlledEnemy = en;
         e.savedMoveMode = cm ? cm->MovementMode : SDK::EMovementMode::MOVE_Walking;
+        e.savedAiDisabled = en->bIsAIDisabled;
         QD_DEBUG(kTag, "follow {:016X} ({}), AI off", e.id, ue::Name(en));
     }
     en->bIsAIDisabled = true;   // re-asserted every frame: the enemy BP may clear it
@@ -1096,6 +1176,14 @@ void Rebuild(double now) {
             if (auto it = bySpawner.find(en->OwningSpawner); it != bySpawner.end()) {
                 const Entry& owner = s.entries[it->second];
                 if (!owner.seenEnemy) id = it->second;   // spawner already holds another enemy -> separate id
+                else if (s.active && !s.isHost && now - owner.forcedAt < kDupCleanSec && Valid(owner.enemy) &&
+                         !owner.enemy->bDead) {
+                    // 1.0.5: our forced respawn and the spawner's own attempt both produced an enemy. The spawner
+                    // manages one; the other would be a copy nobody syncs.
+                    QD_INFO(kTag, "{:016X}: second copy {} after a forced respawn, removed", it->second, ue::Name(en));
+                    en->K2_DestroyActor();
+                    continue;
+                }
             }
         }
         if (!id) id = ue::Fnv1a64(ue::PathName(en));   // placed enemies: path names match across machines
@@ -1201,9 +1289,45 @@ const Cand* NearestCand(const SDK::FVector& pos, const Entry& e, double now) {
     return best;
 }
 
+// 1.0.6: bosses that fight as a pair (their spawners list each other in PairedBossSpawners) reference each other in
+// their Blueprints: intro, "partner dead", shared phases. When the two were run by different machines (one went to
+// the player who talked to it, the other to the host) neither copy saw its partner act: invulnerable bosses, one of
+// them missing or frozen in its intro. The pair now has one leader (lowest id); the others take its owner and lock.
+void HostLinkBossPairs() {
+    auto& s = S();
+    for (auto& [id, e] : s.entries) e.pairLeader = 0;
+    std::vector<uint64_t> group;
+    for (auto& [id, e] : s.entries) {
+        if (e.pairLeader || !Valid(e.spawner)) continue;
+        auto* sp = static_cast<SDK::AEnemySpawner_C*>(e.spawner);
+        const auto& paired = sp->PairedBossSpawners;
+        const int n = paired.Num();
+        if (n <= 0 || n > 8) continue;
+        group.clear();
+        group.push_back(id);
+        for (int i = 0; i < n; ++i) {
+            SDK::AEnemySpawner_C* other = paired[i];
+            if (!Valid(other)) continue;
+            if (auto it = s.spawnerIds.find(other); it != s.spawnerIds.end() && s.entries.contains(it->second))
+                group.push_back(it->second);
+        }
+        if (group.size() < 2) continue;
+        // Leader: the lowest id among the members that are alive, so a pair whose leader dies carries on under the
+        // survivor (which keeps its owner and its lock).
+        uint64_t leader = 0;
+        for (uint64_t g : group) {
+            const Entry& ge = s.entries[g];
+            if (Valid(ge.enemy) && !ge.enemy->bDead && (!leader || g < leader)) leader = g;
+        }
+        if (!leader) continue;
+        for (uint64_t g : group) s.entries[g].pairLeader = leader;
+    }
+}
+
 void HostEvaluateOwners(double now) {
     auto& s = S();
     std::vector<OwnerChange> changes;
+    HostLinkBossPairs();
 
     // Owners that cannot simulate any more: left, silent, or the enemy is dead / gone on the host (the host's
     // spawners are the only authority on death and respawn, so a dead enemy always belongs to the host).
@@ -1245,19 +1369,90 @@ void HostEvaluateOwners(double now) {
         if (!NearAnyPlayer(pos, kRelevantRange)) continue;   // only enemies within 60 m of someone take part
         const OwnerRec& rec = OwnerOf(id);
         const uint8_t cur = rec.slot;
+        if (e.pairLeader && e.pairLeader != id) {
+            // paired boss: same owner and lock as its leader; none of the rules below apply to it
+            const uint8_t want = OwnerOf(e.pairLeader).slot;
+            if (auto le = s.entries.find(e.pairLeader); le != s.entries.end()) {
+                e.bossLockSlot = le->second.bossLockSlot;
+                // someone talked to this one: the leader inherits it, so the pair goes to that player
+                if (e.interactSlot < net::kMaxPlayers && now - e.interactAt < kBossInteractSec &&
+                    e.interactAt > le->second.interactAt) {
+                    le->second.interactSlot = e.interactSlot;
+                    le->second.interactAt = e.interactAt;
+                }
+                if (e.lastHitAt > le->second.lastHitAt) {
+                    le->second.lastHitSlot = e.lastHitSlot;
+                    le->second.lastHitAt = e.lastHitAt;
+                }
+                for (int k = 0; k < net::kMaxPlayers; ++k) le->second.hitAt[k] = std::max(le->second.hitAt[k], e.hitAt[k]);
+            }
+            if (want != OwnerOf(id).slot && MemberPresent(want)) changes.push_back({id, want, "成对", true});
+            continue;
+        }
+        // 1.0.6: bosses and every enemy that starts dormant (its spawner's behaviour mode is not the plain one) are
+        // run by the host. A dormant enemy is woken, kept awake, made damageable and reset by game logic that only
+        // looks at the machine it runs on - arena triggers, "damage off until triggered", "player left the arena" -
+        // and a client's spawners are held back by us, so on a client that logic was unreliable in every one of those
+        // steps (tests: a Whaleking run by the client took no damage even when awake). The host's is intact. It
+        // still fights whoever attacks it: see ChooseBossTarget. Only when the host's own player is dead or far
+        // outside the enemy's spawner range (its game would remove the enemy) do the ordinary rules apply.
+        {
+            bool special = IsBossLike(e, en);
+            if (Valid(e.spawner))
+                special = special || static_cast<int>(static_cast<SDK::AEnemySpawner_C*>(e.spawner)->BehaviourMode) != 0;
+            // "There" = within the boss range. Farther away the host's game barely updates the enemy (test: a
+            // Whaleking 100 m from the host woke up but did not attack), so a player fighting it alone runs it.
+            bool hostThere = false;
+            for (const Cand& k : s.cands)
+                if (k.slot == 0 && k.alive && Dist(pos, k.pos) <= kBossLockRange) hostThere = true;
+            e.hostRun = special && hostThere;
+            if (e.hostRun) {
+                e.bossLockSlot = 0xFF;
+                if (cur != 0) changes.push_back({id, 0, "房主专管", true});
+                continue;
+            }
+        }
         const bool boss = IsBossLike(e, en);
         bool ownerNear = false;
         if (boss && CandAlive(cur))
             for (const Cand& k : s.cands)
-                if (k.slot == cur && k.alive && Dist(pos, k.pos) <= kRelevantRange) ownerNear = true;
-        if (e.lastHitSlot < net::kMaxPlayers && now - e.lastHitAt < kHitAggroSec && CandAlive(e.lastHitSlot)) {
-            // 1. aggro: the last hitter (repeat hits by the current owner change nothing). Bosses: at most every 12 s
-            //    while their owner is still there.
-            const double minGap = boss && ownerNear ? kBossHitSwitchSec : kHitSwitchMinSec;
-            if (e.lastHitSlot != cur && now - rec.changedAt >= minGap)
-                changes.push_back({id, e.lastHitSlot, "命中", true});
-        } else if (boss && ownerNear) {
-            // a boss stays with its owner while that player is alive and within 60 m
+                if (k.slot == cur && k.alive && Dist(pos, k.pos) <= kBossLockRange) ownerNear = true;
+        // 1.0.4 boss lock: taken when the boss is fighting on its owner's machine, released when that player is dead,
+        // gone or out of the arena.
+        if (e.bossLockSlot != 0xFF && (e.bossLockSlot != cur || !ownerNear)) {
+            QD_INFO(kTag, "{:016X} ({}): boss lock released (P{})", id, ue::Name(en), e.bossLockSlot + 1);
+            e.bossLockSlot = 0xFF;
+        }
+        const bool talked = boss && e.interactSlot < net::kMaxPlayers && now - e.interactAt < kBossInteractSec &&
+                            CandAlive(e.interactSlot);
+        if (boss && e.bossLockSlot == 0xFF && talked && e.interactSlot != cur) {
+            // 0. talk-to-start bosses: the fight starts in the copy of the player who talked, so that copy must be the
+            //    one that runs.
+            changes.push_back({id, e.interactSlot, "对话", true});
+            continue;
+        }
+        bool pairEngaged = false;
+        if (e.pairLeader == id)
+            for (auto& [mid, me] : s.entries)
+                if (mid != id && me.pairLeader == id && Valid(me.enemy) && !me.enemy->bDead &&
+                    Engaged(me, me.enemy, OwnerOf(mid).slot, now))
+                    pairEngaged = true;
+        if (boss && e.bossLockSlot == 0xFF && ownerNear && (talked || pairEngaged || Engaged(e, en, cur, now))) {
+            e.bossLockSlot = cur;
+            QD_INFO(kTag, "{:016X} ({}): boss lock -> P{}", id, ue::Name(en), cur + 1);
+        }
+        if (boss && e.bossLockSlot != 0xFF) {
+            // locked: hits and proximity never move it
+        } else if (e.lastHitSlot < net::kMaxPlayers && now - e.lastHitAt < kHitAggroSec && CandAlive(e.lastHitSlot)) {
+            // 1. aggro: the last hitter, unless the current owner is fighting it (1.0.5: engaged, within 25 m and
+            //    with a hit of their own in the last 6 s). Repeat hits by the current owner change nothing.
+            if (e.lastHitSlot != cur && now - rec.changedAt >= kHitSwitchMinSec) {
+                bool ownerFights = false;
+                if (CandAlive(cur) && cur < net::kMaxPlayers && now - e.hitAt[cur] < kHitAggroSec && Engaged(e, en, cur, now))
+                    for (const Cand& k : s.cands)
+                        if (k.slot == cur && k.alive && Dist(pos, k.pos) <= kOwnerFightRange) ownerFights = true;
+                if (!ownerFights) changes.push_back({id, e.lastHitSlot, "命中", true});
+            }
         } else if (CandAlive(cur) && Engaged(e, en, cur, now)) {
             // 2. chasing / attacking its owner: keep
         } else if (now - rec.changedAt >= kOwnerSwitchSec) {
@@ -1335,8 +1530,16 @@ void SimTick(double now, float dt) {
     msg.seq = ++s.seq;
     msg.ownerSlot = s.localSlot;
     int live = 0;
+    int remoteTargets = 0;
     for (auto& [id, e] : s.entries) {
+        if (IsMine(id) && Valid(e.enemy) && !e.enemy->bDead && (e.hostRun || IsBossLike(e, e.enemy)) && EngagedLive(e.enemy))
+            ChooseBossTarget(e, e.enemy, now);
+        if (IsMine(id) && Valid(e.enemy) && !e.enemy->bDead && e.targetSlot < net::kMaxPlayers && e.targetSlot != s.localSlot)
+            ++remoteTargets;
+        (void)remoteTargets;
+        if (IsMine(id)) e.followTarget = 0xFF;
         if (!IsMine(id)) {
+            e.targetSlot = 0xFF;   // a later takeover starts with a fresh choice
             e.relevant = false;
             continue;
         }
@@ -1471,6 +1674,19 @@ bool HasCustomAttacks(Entry& e, SDK::AEnemyBase_C* en) {
 
 // ---- simulator hooks
 
+// 1.0.6: an attack event carries, above its index, the slot of the player being attacked (+1; 0 = the owner), so the
+// other machines can aim their copy's attack at that player instead of at their own.
+int32_t PackAttack(int32_t index, const Entry& e) {
+    auto& s = S();
+    const uint8_t target = e.targetSlot < net::kMaxPlayers ? e.targetSlot : s.localSlot;
+    return (index & 0x00FFFFFF) | (static_cast<int32_t>(target + 1) << 24);
+}
+int32_t AttackIndex(int32_t arg) { return arg & 0x00FFFFFF; }
+uint8_t AttackTarget(int32_t arg, uint8_t ownerSlot) {
+    const int t = (arg >> 24) & 0x0F;
+    return t >= 1 && t <= net::kMaxPlayers ? static_cast<uint8_t>(t - 1) : ownerSlot;
+}
+
 bool OnStartAttackPre(hooks::CallInfo& ci) {
     auto& s = S();
     if (!s.active || !ci.object || !ci.params) return false;
@@ -1490,7 +1706,7 @@ bool OnStartAttackPre(hooks::CallInfo& ci) {
     // see ReplayAttack) rolls the same random choices.
     const uint32_t seed = NextSeed();
     ue::SeedGameRand(seed);
-    SendEvent(e.id, net::EnemyEventType::AttackStart, idx, seed);
+    SendEvent(e.id, net::EnemyEventType::AttackStart, PackAttack(idx, e), seed);
     return false;
 }
 
@@ -1500,25 +1716,246 @@ void WakeLocal(Entry& e, SDK::AEnemyBase_C* en, bool damaged, const char* why) {
     e.wokenFor = en;
     // No InTrapMode check: some bosses wait in their own dormant state with InTrapMode false (the Whaleking
     // meditates) and still start through ActivateTrap. wokenFor already tells us this copy has not been started.
+    // 1.0.6: the game wakes a dormant enemy in two steps (traced on the Whaleking: PlayerEnteredArena ->
+    // ActivateEnemyAI -> ActivateTrap -> DoIntro). Only the second was done here, so an enemy woken from another
+    // machine played its rise and then stood there with its AI off - and an enemy with its AI off ignores damage.
+    // While we merely follow it the AI stays ours to hold; it is switched on when the enemy is handed to us.
     auto& s = S();
     SDK::Params::EnemyBase_C_ActivateTrap p{};
     p.Damaged = damaged;
     s.wakingLocal = true;
-    Call(en, "ActivateTrap", p);
+    bool arena = false;
+    if (!e.controlled && Fn(en, "PlayerEnteredArena")) {
+        // arena bosses: the game's own entry point (AI on, rise, intro, damage on)
+        uint8_t none[16]{};
+        arena = Call(en, "PlayerEnteredArena", none);
+    }
+    if (!arena) {
+        if (!e.controlled) {
+            uint8_t none[16]{};
+            Call(en, "ActivateEnemyAI", none);
+        }
+        Call(en, "ActivateTrap", p);
+    }
     s.wakingLocal = false;
+    if (!e.controlled && en->bIsAIDisabled) en->bIsAIDisabled = false;
     QD_INFO(kTag, "{:016X} ({}) woken: {}", e.id, ue::Name(en), why);
 }
 
 // Any machine: its copy of an enemy left trap mode. Our own WakeLocal is not echoed.
-void OnActivateTrapPost(hooks::CallInfo& ci) {
+// 1.0.5: the game calls ActivateTrap on plenty of enemies that are not dormant at all (robots, mecha knights: every
+// few seconds), and the function returns without doing anything when its own conditions are not met. Every one of
+// those calls used to be broadcast as "rose", and the other machines then forced their copies awake. Now the state
+// before the call is compared with the state after it.
+struct TrapCall {
+    const SDK::UObject* enemy = nullptr;
+    bool trap = false, aiOff = false;
+};
+std::vector<TrapCall> g_trapCalls;
+
+// 1.0.6: many ambush enemies and the Whaleking play their rise first and only change InTrapMode / the AI flag when
+// it has finished, so comparing the state right after ActivateTrap missed them: the machine that ran the enemy never
+// learnt that it had risen for another player, kept it dormant, and a dormant enemy ignores damage. A dormant enemy
+// is therefore watched for a few seconds after the call: leaving trap mode, its AI coming on, or a new montage (the
+// rise animation) counts.
+struct RiseWatch {
+    uint64_t id = 0;
+    const SDK::UObject* enemy = nullptr;
+    const void* montage = nullptr;
+    bool   trap = false, aiOff = false, damaged = false;
+    double until = 0;
+};
+std::vector<RiseWatch> g_riseWatch;
+
+void AnnounceRise(Entry& e, SDK::AEnemyBase_C* en, bool damaged, const char* how) {
+    auto& s = S();
+    if (e.wokenFor == en) return;
+    e.wokenFor = en;
+    if (!s.active || en->bDead) return;
+    QD_INFO(kTag, "{:016X} ({}) rose here ({}), telling the others", e.id, ue::Name(en), how);
+    SendEvent(e.id, net::EnemyEventType::Woke, damaged ? 1 : 0);
+}
+
+void RiseWatchTick(double now) {
+    auto& s = S();
+    for (size_t i = 0; i < g_riseWatch.size();) {
+        RiseWatch& w = g_riseWatch[i];
+        bool done = now > w.until;
+        auto it = s.entries.find(w.id);
+        if (it == s.entries.end() || it->second.enemy != w.enemy || !Valid(it->second.enemy) || it->second.enemy->bDead) {
+            done = true;
+        } else if (it->second.wokenFor == w.enemy) {
+            done = true;
+        } else {
+            Entry& e = it->second;
+            SDK::AEnemyBase_C* en = e.enemy;
+            SDK::UAnimMontage* m = en->GetCurrentMontage();
+            const char* how = nullptr;
+            if (w.trap && !en->InTrapMode) how = "left trap mode";
+            else if (!e.controlled && w.aiOff && !en->bIsAIDisabled) how = "AI came on";
+            else if (Valid(m) && m != w.montage) how = "rise animation";
+            if (how) {
+                AnnounceRise(e, en, w.damaged, how);
+                done = true;
+            }
+        }
+        if (done) {
+            g_riseWatch[i] = g_riseWatch.back();
+            g_riseWatch.pop_back();
+        } else {
+            ++i;
+        }
+    }
+}
+
+// The first step of a wake (see WakeLocal). When the game runs it on a dormant enemy here - the local player entered
+// the arena, stepped into the trigger - that enemy has risen on this machine, whatever ActivateTrap reports after it
+// (by then the AI flag is already on, which is why 1.0.5 missed the Whaleking's rise).
+std::vector<TrapCall> g_aiCalls;
+
+bool OnActivateAiPre(hooks::CallInfo& ci) {
+    if (ci.object && g_aiCalls.size() < 64) {
+        auto* en = static_cast<SDK::AEnemyBase_C*>(ci.object);
+        g_aiCalls.push_back({ci.object, en->InTrapMode, en->bIsAIDisabled});
+    }
+    return false;
+}
+
+void OnActivateAiPost(hooks::CallInfo& ci) {
     auto& s = S();
     if (!ci.object) return;
+    TrapCall before{};
+    bool have = false;
+    for (size_t i = g_aiCalls.size(); i-- > 0;) {
+        if (g_aiCalls[i].enemy != ci.object) continue;
+        before = g_aiCalls[i];
+        have = true;
+        g_aiCalls.erase(g_aiCalls.begin() + static_cast<std::ptrdiff_t>(i));
+        break;
+    }
+    if (g_aiCalls.size() > 32) g_aiCalls.clear();
+    if (!have || s.wakingLocal) return;
     auto bi = s.byEnemy.find(ci.object);
     if (bi == s.byEnemy.end()) return;
     auto ei = s.entries.find(bi->second);
     if (ei == s.entries.end()) return;
     Entry& e = ei->second;
     auto* en = static_cast<SDK::AEnemyBase_C*>(ci.object);
+    const bool wasDormant = before.trap || (e.controlled ? e.savedAiDisabled : before.aiOff);
+    if (wasDormant) AnnounceRise(e, en, false, "AI activated");
+}
+
+// 1.0.6: a boss goes back to its dormant state when "the player" has left its arena - the player of the machine it
+// runs on. With several players that is the wrong question: the owner may stand at the edge, may have teleported to
+// the host (the arena never saw him walk in), may have just taken the boss over from someone else, while the others
+// are in the middle of the fight. The boss then sat down, became dormant (and immune to damage) and started again
+// with its intro when someone triggered it: "it keeps falling from the sky". While another living player is within
+// the boss's range the reset is not run.
+const SDK::UObject* g_trapModeSkipped = nullptr;
+
+bool OnEnterTrapModePre(hooks::CallInfo& ci) {
+    auto& s = S();
+    g_trapModeSkipped = nullptr;
+    if (!s.active || !ci.object) return false;
+    auto bi = s.byEnemy.find(ci.object);
+    if (bi == s.byEnemy.end()) return false;
+    auto ei = s.entries.find(bi->second);
+    if (ei == s.entries.end()) return false;
+    Entry& e = ei->second;
+    auto* en = static_cast<SDK::AEnemyBase_C*>(ci.object);
+    if (e.wokenFor != en || en->bDead || !IsBossLike(e, en)) return false;   // not risen here: its spawn set-up
+    bool keep = false;
+    uint8_t who = 0xFF;
+    if (IsMine(bi->second)) {
+        const SDK::FVector pos = en->K2_GetActorLocation();
+        for (const Cand& c : s.cands)
+            if (c.alive && c.slot != s.localSlot && Dist(pos, c.pos) <= kBossLockRange) {
+                keep = true;
+                who = c.slot;
+            }
+    } else if (e.controlled && !e.snaps.empty() && Now() - e.seenAt < kOwnerSilentSec) {
+        keep = (e.snaps.back().s.flags & (1 | 32)) == 32;   // its owner's copy is up and alive
+        who = OwnerOf(bi->second).slot;
+    }
+    if (!keep) return false;
+    const double now = Now();
+    if (now - e.resetBlockLogAt > 10.0) {
+        e.resetBlockLogAt = now;
+        QD_INFO(kTag, "{:016X} ({}): reset to dormant not run, P{} is still in the fight", e.id, ue::Name(en), who + 1);
+    }
+    g_trapModeSkipped = ci.object;
+    return true;
+}
+
+// An enemy that goes back to its dormant state (a boss whose fight is reset sits down again) can rise again later:
+// forget that this copy has risen, on every machine that sees it happen.
+void OnEnterTrapModePost(hooks::CallInfo& ci) {
+    auto& s = S();
+    if (!ci.object) return;
+    if (g_trapModeSkipped == ci.object) {
+        g_trapModeSkipped = nullptr;
+        return;
+    }
+    auto bi = s.byEnemy.find(ci.object);
+    if (bi == s.byEnemy.end()) return;
+    auto ei = s.entries.find(bi->second);
+    if (ei == s.entries.end()) return;
+    Entry& e = ei->second;
+    if (e.wokenFor != ci.object) return;
+    e.wokenFor = nullptr;
+    QD_INFO(kTag, "{:016X} ({}) is dormant again", e.id, ue::Name(ci.object));
+}
+
+bool OnActivateTrapPre(hooks::CallInfo& ci) {
+    if (ci.object && g_trapCalls.size() < 64) {
+        auto* en = static_cast<SDK::AEnemyBase_C*>(ci.object);
+        g_trapCalls.push_back({ci.object, en->InTrapMode, en->bIsAIDisabled});
+    }
+    return false;
+}
+
+void OnActivateTrapPost(hooks::CallInfo& ci) {
+    auto& s = S();
+    if (!ci.object) return;
+    TrapCall before{};
+    bool haveBefore = false;
+    for (size_t i = g_trapCalls.size(); i-- > 0;) {
+        if (g_trapCalls[i].enemy != ci.object) continue;
+        before = g_trapCalls[i];
+        haveBefore = true;
+        g_trapCalls.erase(g_trapCalls.begin() + static_cast<std::ptrdiff_t>(i));
+        break;
+    }
+    if (g_trapCalls.size() > 32) g_trapCalls.clear();   // a lost post must not grow this forever
+    auto bi = s.byEnemy.find(ci.object);
+    if (bi == s.byEnemy.end()) return;
+    auto ei = s.entries.find(bi->second);
+    if (ei == s.entries.end()) return;
+    Entry& e = ei->second;
+    auto* en = static_cast<SDK::AEnemyBase_C*>(ci.object);
+    // Rose = left trap mode, or its AI was switched on by the call. While we follow an enemy we hold its AI off
+    // ourselves, so there the AI flag only counts for a copy that has not risen here yet.
+    bool rose = !haveBefore;
+    if (haveBefore) {
+        rose = before.trap && !en->InTrapMode;
+        if (!rose && before.aiOff && !en->bIsAIDisabled) rose = !e.controlled || e.wokenFor != en;
+    }
+    if (!rose && !s.wakingLocal && haveBefore && e.wokenFor != en && !en->bDead) {
+        // Not visibly risen yet. If it was dormant before the call, watch it (see RiseWatch). While we follow an
+        // enemy its AI flag is ours, so there "dormant" is what it had when we started following it.
+        const bool wasDormant = before.trap || (e.controlled ? e.savedAiDisabled : before.aiOff);
+        if (wasDormant && g_riseWatch.size() < 64) {
+            bool known = false;
+            for (const RiseWatch& w : g_riseWatch) known |= w.enemy == ci.object;
+            if (!known) {
+                const bool dmg = ci.params && static_cast<SDK::Params::EnemyBase_C_ActivateTrap*>(ci.params)->Damaged;
+                SDK::UAnimMontage* m = en->GetCurrentMontage();
+                g_riseWatch.push_back({e.id, ci.object, Valid(m) ? static_cast<const void*>(m) : nullptr, before.trap,
+                                       e.controlled ? e.savedAiDisabled : before.aiOff, dmg, Now() + kRiseWatchSec});
+            }
+        }
+    }
+    if (!rose && !s.wakingLocal) return;
     e.wokenFor = en;
     if (!s.active || s.wakingLocal || en->bDead) return;
     const bool damaged = ci.params && static_cast<SDK::Params::EnemyBase_C_ActivateTrap*>(ci.params)->Damaged;
@@ -1537,7 +1974,7 @@ bool OnCustomAttackPre(hooks::CallInfo& ci, int index) {
     Entry& e = ei->second;
     e.customAttacks = true;
     if (!IsMine(bi->second) || !e.relevant) return false;
-    SendEvent(e.id, net::EnemyEventType::CustomAttack, index);
+    SendEvent(e.id, net::EnemyEventType::CustomAttack, PackAttack(index, e));
     return false;
 }
 
@@ -1554,6 +1991,10 @@ void OnEnemyInteractPost(hooks::CallInfo& ci) {
     if (now - e.interactSentAt < kInteractNoticeSec) return;
     e.interactSentAt = now;
     QD_INFO(kTag, "{:016X} ({}): local interaction, telling the others", e.id, ue::Name(ci.object));
+    if (s.isHost) {
+        e.interactSlot = s.localSlot;
+        e.interactAt = now;
+    }
     SendEvent(e.id, net::EnemyEventType::Interacted, 0);
 }
 
@@ -1593,6 +2034,7 @@ void OnBossBarPost(hooks::CallInfo& ci, bool on) {
         ei->second.bossBar = true;
         if (NoteEnemyTier(en, true)) ApplyScaling("boss bar");   // calls GetMaxHP (ProcessEvent)
     }
+    if (on && !s.wakingLocal && !s.callingBossBar) AnnounceRise(ei->second, static_cast<SDK::AEnemyBase_C*>(en), false, "boss bar");
     if (IsMine(id)) SendEvent(id, on ? net::EnemyEventType::BossBarOn : net::EnemyEventType::BossBarOff, 0);
 }
 
@@ -1684,6 +2126,7 @@ void ApplyRemoteDamage(Entry& e, const net::MsgDamageRequest& m) {
 
     SDK::FFB_DamageAttributeSet* dmg = PrepareDamage(m);
     if (!dmg) return;
+    WakeOnHit(e, en);
 
     auto& p = *s.tadParams;
     const SDK::FVector loc = en->K2_GetActorLocation();
@@ -1700,6 +2143,7 @@ void ApplyRemoteDamage(Entry& e, const net::MsgDamageRequest& m) {
     s.applyingRemote = true;   // our TryApplyDamage pre hook must not treat this as a local hit
     Call(en, "TryApplyDamage", p);
     s.applyingRemote = false;
+    AddThreat(e, m.attackerSlot, m.damage);
     QD_DEBUG(kTag, "slot {} hit {:016X} for {:.1f}: HP {:.1f} -> {:.1f}", m.attackerSlot, m.enemyId, m.damage, before,
              Valid(en) ? en->HP : -1.0f);
     LogEvent(std::format("伤害 P{} → {:04X} {:.0f}", m.attackerSlot + 1, ShortId(m.enemyId), m.damage));
@@ -1732,10 +2176,17 @@ void OnDamageRequest(uint8_t fromSlot, const uint8_t* data, size_t size) {
             if (it != s.entries.end()) {   // aggro input for the ownership evaluation (rule 1)
                 it->second.lastHitSlot = fromSlot;
                 it->second.lastHitAt = now;
+                it->second.hitAt[fromSlot] = now;
             }
         }
         if (m.flags & net::kDamageHitNotifyOnly) return;   // the owner already settled it locally
-        const uint8_t owner = OwnerOf(m.enemyId).slot;
+        uint8_t owner = OwnerOf(m.enemyId).slot;
+        if (forwarded && owner == fromSlot && owner != 0) {
+            // the owner itself returned the hit: it has no copy to settle it on
+            QD_INFO(kTag, "{:016X}: P{} owns it without a copy, the host takes it", m.enemyId, owner + 1);
+            HostSetOwner(m.enemyId, 0, "无副本", false);
+            owner = 0;
+        }
         if (owner != 0 && MemberPresent(owner)) {   // relay to the owner, with the original attacker filled in
             coop::SendToSlot(owner, net::Channel::Reliable, net::Encode(m));
             LogEvent(std::format("转发 P{} → {:04X} 给 P{}", fromSlot + 1, ShortId(m.enemyId), owner + 1));
@@ -1759,6 +2210,16 @@ void OnDamageRequest(uint8_t fromSlot, const uint8_t* data, size_t size) {
             m.flags |= net::kDamageForwarded;
             coop::SendToHost(net::Channel::Reliable, net::Encode(m));
             QD_INFO(kTag, "relayed hit on {:016X} sent back to the host: owner is now P{}", m.enemyId, OwnerOf(m.enemyId).slot + 1);
+        }
+        return;
+    }
+    // 1.0.6: we own it but have no living copy (not spawned here, already removed). The hit used to disappear and the
+    // enemy could not be hurt until the host noticed our silence. Give it back; the host takes the enemy over.
+    if (SDK::AEnemyBase_C* own = it->second.enemy; !Valid(own) || own->bDead) {
+        if ((m.flags & net::kDamageForwarded) == 0) {
+            m.flags |= net::kDamageForwarded;
+            coop::SendToHost(net::Channel::Reliable, net::Encode(m));
+            QD_INFO(kTag, "hit on {:016X} sent back to the host: we own it but have no copy", m.enemyId);
         }
         return;
     }
@@ -1807,6 +2268,7 @@ void SendDamageRequest(Entry& e, uint8_t owner, const SDK::FFB_DamageAttributeSe
     if (s.isHost) {
         e.lastHitSlot = s.localSlot;
         e.lastHitAt = Now();
+        e.hitAt[s.localSlot] = e.lastHitAt;
         coop::SendToSlot(owner, net::Channel::Reliable, net::Encode(m));
     } else {
         coop::SendToHost(net::Channel::Reliable, net::Encode(m));
@@ -1814,12 +2276,25 @@ void SendDamageRequest(Entry& e, uint8_t owner, const SDK::FFB_DamageAttributeSe
 }
 
 // Simulator: the local player hit an enemy we own — the game settles it normally; tell the host who hit (aggro).
+// 1.0.6 safety net. An enemy this machine runs that is still dormant while a player is hitting it has missed its
+// wake (its trigger fired before the copy existed here - a teleport to the host, a late spawn - and nobody else
+// triggered it). Dormant enemies ignore damage, so it would stay unkillable. The hit wakes it.
+void WakeOnHit(Entry& e, SDK::AEnemyBase_C* en) {
+    auto& s = S();
+    if (!s.active || !en || en->bDead || e.wokenFor == en || e.controlled) return;
+    if (!en->bIsAIDisabled && !en->InTrapMode) return;
+    WakeLocal(e, en, true, "hit while dormant");
+    SendEvent(e.id, net::EnemyEventType::Woke, 1);
+}
+
 void NoteLocalHit(Entry& e, float damage) {
     auto& s = S();
     const double now = Now();
+    AddThreat(e, s.localSlot, damage);
     if (s.isHost) {
         e.lastHitSlot = s.localSlot;
         e.lastHitAt = now;
+        e.hitAt[s.localSlot] = now;
         return;
     }
     if (now - e.lastNotifyAt < kHitNotifySec) return;
@@ -1851,7 +2326,10 @@ bool OnTryApplyDamagePre(hooks::CallInfo& ci) {
                 auto* p = static_cast<SDK::Params::EnemyBase_C_TryApplyDamage*>(ci.params);
                 const uint8_t owner = OwnerOf(e.id).slot;
                 if (owner == s.localSlot) {
-                    if (IsLocalPlayerSource(p->Applier)) NoteLocalHit(e, p->DamageToApply.DamageAmount);
+                    if (IsLocalPlayerSource(p->Applier)) {
+                        WakeOnHit(e, en);
+                        NoteLocalHit(e, p->DamageToApply.DamageAmount);
+                    }
                 } else if (e.controlled && e.controlledEnemy == en) {
                     if (IsLocalPlayerSource(p->Applier)) SendDamageRequest(e, owner, p->DamageToApply);
                     f.active = true;
@@ -1918,9 +2396,67 @@ void HostTakeBackResets() {
     }
 }
 
+// A living enemy of this spawner that we do not track under this entry (another entry holds it, or the id map has
+// not caught up yet).
+SDK::AEnemyBase_C* LivingEnemyOf(const SDK::UObject* spawner) {
+    auto& s = S();
+    static std::vector<SDK::AActor*> all;
+    all.clear();
+    if (s.cls.enemyBase) ActorsOfClass(s.cls.enemyBase, all);
+    for (SDK::AActor* a : all) {
+        auto* en = static_cast<SDK::AEnemyBase_C*>(a);
+        if (Valid(en) && !en->bDead && !IsPreview(en) && en->OwningSpawner == spawner) return en;
+    }
+    return nullptr;
+}
+
 void ForceRespawn(Entry& e) {
     auto& s = S();
     if (!Valid(e.spawner)) return;
+    const double now = Now();
+    // 1.0.5: the spawner may already have a living enemy that this entry does not point at. Respawning then put a
+    // second enemy on the same spot (one of them a copy nobody syncs). Use the one that is there.
+    if (SDK::AEnemyBase_C* have = LivingEnemyOf(e.spawner)) {
+        QD_INFO(kTag, "{:016X}: owner has it alive, {} is already here - no respawn", e.id, ue::Name(have));
+        if (auto bi = s.byEnemy.find(have); bi == s.byEnemy.end() || bi->second == e.id) {
+            AttachEnemy(e, have);
+            s.byEnemy[have] = e.id;
+        }
+        return;
+    }
+    // 1.0.5. On a client the spawner's own (re)spawn functions are blocked (the host decides), so a missing copy only
+    // appears when we let it. Two things went wrong before:
+    //  - it was forced even when the local player was far outside the spawner's range, where the game keeps no enemy;
+    //  - "Force Respawn" opened the 6 s window in which the spawner's own queued spawn attempt also went through:
+    //    two enemies on one spot, one of them a copy nobody synced (it could not be damaged). Star Lizards spawned
+    //    again and again this way left extra loot sacks.
+    // Now: out of range -> nothing. Spawner already trying -> only open the window and let that one attempt spawn.
+    // Otherwise (or if its attempt has not produced anything for kNativeSpawnWaitSec) -> Force Respawn.
+    auto* sp = static_cast<SDK::AEnemySpawner_C*>(e.spawner);
+    SDK::ACharacter* ch = ue::LocalCharacter();
+    if (!ch) return;
+    const float dist = Dist(ch->K2_GetActorLocation(), sp->K2_GetActorLocation());
+    float range = sp->MaxSpawnDistance > 0 ? sp->MaxSpawnDistance : kRelevantRange;
+    if (sp->PlayerDistanceDespawnCheck > 0 && sp->PlayerDistanceDespawnCheck < range) range = sp->PlayerDistanceDespawnCheck;
+    if (dist > range * 0.8f) {
+        if (now - e.respawnSkipLogAt > 30.0) {
+            e.respawnSkipLogAt = now;
+            QD_INFO(kTag, "{:016X}: owner has it alive, we are out of its spawner's range ({}; {:.0f} m, range {:.0f} m)", e.id,
+                    ue::Name(e.spawner), dist / 100.0f, range / 100.0f);
+        }
+        return;
+    }
+    if (e.missingSince < 0 || now - e.missingSeenAt > 2.0 * kRespawnRetrySec) e.missingSince = now;
+    e.missingSeenAt = now;
+    if (sp->InSpawnAttemptLoop && now - e.missingSince < kNativeSpawnWaitSec) {
+        s.spawnerAllowUntil[e.spawner] = now + kSpawnerAllowSec;
+        QD_INFO(kTag, "{:016X}: owner has it alive, letting the spawner's own attempt through ({}; {:.0f} m)", e.id,
+                ue::Name(e.spawner), dist / 100.0f);
+        return;
+    }
+    e.forcedAt = now;
+    QD_INFO(kTag, "{:016X}: owner has it alive, ours is gone - respawning it ({}; {:.0f} m, range {:.0f} m{})", e.id,
+            ue::Name(e.spawner), dist / 100.0f, range / 100.0f, sp->InSpawnAttemptLoop ? ", its own attempt gave nothing" : "");
     s.spawnerAllowUntil[e.spawner] = Now() + kSpawnerAllowSec;
     uint8_t noParams[16]{};
     if (Call(e.spawner, "Force Respawn", noParams))
@@ -1957,13 +2493,213 @@ uint8_t TierOf(SDK::AEnemyBase_C* en) {
 // attack actions, BP-driven hitboxes, projectiles — so it runs BP_StartAttackState on our copy, with the game's rand()
 // seeded like the owner's. If that does not start a montage (the BP declined, e.g. a state check), fall back to the
 // plain montage.
+void FadeThreat(Entry& e, double now) {
+    if (e.threatAt > 0 && now > e.threatAt) {
+        const float k = static_cast<float>(std::pow(0.5, (now - e.threatAt) / kThreatHalfLife));
+        for (float& t : e.threat) t *= k;
+    }
+    e.threatAt = now;
+}
+
+void AddThreat(Entry& e, uint8_t slot, float damage) {
+    if (slot >= net::kMaxPlayers || !std::isfinite(damage) || damage <= 0) return;
+    const double now = Now();
+    FadeThreat(e, now);
+    e.threat[slot] += std::min(damage, kMaxDamage);
+    e.threatHitAt = now;
+}
+
+// Owner of a boss: which player it fights. Candidates are the living players within the boss's arena range.
+void ChooseBossTarget(Entry& e, SDK::AEnemyBase_C* en, double now) {
+    auto& s = S();
+    FadeThreat(e, now);
+    const SDK::FVector pos = en->K2_GetActorLocation();
+    const Cand* best = nullptr;
+    const Cand* current = nullptr;
+    const Cand* nearest = nullptr;
+    float nearestD = 0;
+    for (const Cand& c : s.cands) {
+        if (!c.alive || c.slot >= net::kMaxPlayers) continue;
+        const float d = Dist(pos, c.pos);
+        if (d > kBossLockRange) continue;
+        if (c.slot != s.localSlot && !TargetProxy(c.slot, true)) continue;   // nothing to hand to the game
+        if (c.slot == e.targetSlot) current = &c;
+        if (!best || e.threat[c.slot] > e.threat[best->slot]) best = &c;
+        if (!nearest || d < nearestD) {
+            nearest = &c;
+            nearestD = d;
+        }
+    }
+    uint8_t pick = e.targetSlot;
+    if (!current) {
+        pick = best ? best->slot : 0xFF;   // target gone (dead, left the arena): whoever is there
+    } else if (now - e.targetSince >= kTargetMinSec) {
+        if (now - e.threatHitAt > kTargetIdleSec) {
+            if (nearest) pick = nearest->slot;
+        } else if (best && best->slot != e.targetSlot &&
+                   e.threat[best->slot] > e.threat[e.targetSlot] * kTargetSwitchRatio + 1.0f) {
+            pick = best->slot;
+        }
+    }
+    if (pick == e.targetSlot) return;
+    e.targetSlot = pick;
+    e.targetSince = now;
+    if (pick < net::kMaxPlayers)
+        QD_INFO(kTag, "{:016X} ({}): target -> P{}{}", e.id, ue::Name(en), pick + 1, pick == s.localSlot ? " (here)" : "");
+}
+
+// ---- target stand-ins
+// Boss Blueprints get "the player" in two ways: the enemy's own GetTargetPlayer (returns an actor), and the engine's
+// GetPlayerCharacter / GetPlayerPawn (return a character / pawn), which several of them call directly (turning
+// towards the player, the Whaleking's own GetTarget, ...). An avatar is a skeletal mesh actor and must never be handed
+// out where a character is expected, so every remote player gets an invisible, collision-free engine Character that
+// is kept on that player's position. It is a real Character (capsule, movement component), so anything a Blueprint
+// reads from it is valid; casts to the game's player class fail cleanly, which is what "cannot be hurt here" means.
+constexpr float kProxyHalfHeight = 88.0f;
+
+SDK::ACharacter* TargetProxy(uint8_t slot, bool create) {
+    auto& s = S();
+    if (slot >= net::kMaxPlayers) return nullptr;
+    if (Valid(s.proxy[slot])) return s.proxy[slot];
+    s.proxy[slot] = nullptr;
+    if (!create) return nullptr;
+    net::Vec3f feet{};
+    float yaw = 0;
+    if (!playersync::RemotePose(slot, feet, yaw)) return nullptr;
+    SDK::AActor* a = ue::SpawnActor(SDK::ACharacter::StaticClass(), SDK::FVector(feet.x, feet.y, feet.z + kProxyHalfHeight),
+                                    SDK::FRotator(0.0f, yaw, 0.0f));
+    if (!Valid(a) || !a->IsA(SDK::ACharacter::StaticClass())) return nullptr;
+    auto* ch = static_cast<SDK::ACharacter*>(a);
+    ch->SetActorEnableCollision(false);
+    ch->SetActorHiddenInGame(true);
+    if (SDK::UCharacterMovementComponent* cm = ch->CharacterMovement; Valid(cm)) {
+        cm->GravityScale = 0.0f;
+        cm->DisableMovement();
+    }
+    s.proxy[slot] = ch;
+    QD_INFO(kTag, "target stand-in for P{} created ({})", slot + 1, ue::Name(ch));
+    return ch;
+}
+
+void UpdateTargetProxies() {
+    auto& s = S();
+    int alive = 0;
+    for (SDK::ACharacter* ch : s.proxy) alive += Valid(ch) ? 1 : 0;
+    s.remoteTargets = alive;   // the hooks have nothing to do while no stand-in exists
+    for (uint8_t slot = 0; slot < net::kMaxPlayers; ++slot) {
+        SDK::ACharacter* ch = s.proxy[slot];
+        if (!ch) continue;
+        if (!Valid(ch)) {
+            s.proxy[slot] = nullptr;
+            continue;
+        }
+        net::Vec3f feet{};
+        float yaw = 0;
+        if (!playersync::RemotePose(slot, feet, yaw)) continue;
+        SDK::FHitResult hit{};
+        ch->K2_SetActorLocationAndRotation(SDK::FVector(feet.x, feet.y, feet.z + kProxyHalfHeight),
+                                           SDK::FRotator(0.0f, yaw, 0.0f), false, &hit, true);
+    }
+}
+
+void DestroyTargetProxies() {
+    auto& s = S();
+    for (SDK::ACharacter*& ch : s.proxy) {
+        if (Valid(ch)) ch->K2_DestroyActor();
+        ch = nullptr;
+    }
+    s.remoteTargets = 0;
+}
+
+// The stand-in of the player this boss fights, when that is not the local player. nullptr = leave the game's answer.
+SDK::ACharacter* RemoteTargetOf(SDK::UObject* enemy) {
+    auto& s = S();
+    if (!s.active || s.remoteTargets <= 0 || !enemy) return nullptr;
+    auto bi = s.byEnemy.find(enemy);
+    if (bi == s.byEnemy.end()) return nullptr;
+    auto ei = s.entries.find(bi->second);
+    if (ei == s.entries.end()) return nullptr;
+    Entry& e = ei->second;
+    auto* en = static_cast<SDK::AEnemyBase_C*>(enemy);
+    if (en->bDead) return nullptr;
+    if (!IsMine(bi->second)) {
+        // A copy we follow: its attacks are replayed here and must aim at the player the owner's copy attacks. Only
+        // while we hold it (AI off), so nothing else it does is affected.
+        if (!e.controlled) return nullptr;
+        const uint8_t slot = e.followTarget < net::kMaxPlayers ? e.followTarget : OwnerOf(bi->second).slot;
+        if (slot >= net::kMaxPlayers || slot == s.localSlot) return nullptr;
+        return TargetProxy(slot, false);
+    }
+    if (e.targetSlot >= net::kMaxPlayers || e.targetSlot == s.localSlot) return nullptr;
+    if (!e.hostRun && !IsBossLike(e, en)) return nullptr;
+    return TargetProxy(e.targetSlot, false);
+}
+
+// Script functions in which "the player" must stay the local player: the damage path (the applier's stats, hit
+// reactions), anything that throws or grabs the player, interaction.
+bool KeepsLocalPlayer(SDK::UFunction* fn) {
+    static std::unordered_map<const void*, bool> cache;
+    if (!fn) return true;
+    if (auto it = cache.find(fn); it != cache.end()) return it->second;
+    const std::string n = ue::Name(fn);
+    static constexpr const char* kKeep[] = {"TryApplyDamage", "ApplyDamage", "LaunchPlayer", "Interact", "Kill",
+                                            "ReceiveBeginPlay", "BossHPBar", "Dialog", "Cutscene", "Reward"};
+    bool keep = false;
+    for (const char* k : kKeep)
+        if (n.find(k) != std::string::npos) keep = true;
+    if (cache.size() > 4096) cache.clear();
+    cache[fn] = keep;
+    return keep;
+}
+
+// GameplayStatics::GetPlayerCharacter / GetPlayerPawn called from a boss's own Blueprint.
+void OnNativeGetPlayer(SDK::UObject* caller, SDK::UFunction* callerFn, void* result) {
+    auto& s = S();
+    if (s.remoteTargets <= 0 || !s.shield.empty() || s.applyingRemote) return;   // not inside a damage call
+    SDK::ACharacter* proxy = RemoteTargetOf(caller);
+    if (!proxy || KeepsLocalPlayer(callerFn)) return;
+    SDK::AActor** out = static_cast<SDK::AActor**>(result);
+    if (*out && *out == static_cast<SDK::AActor*>(ue::LocalCharacter())) *out = proxy;   // player index 0 only
+}
+
+// The game asks an enemy for its target player. For a boss this machine runs, answer with the chosen player's
+// avatar when that is not the local player. The function returns a plain actor, and everything that needs more
+// than its position (damage, player state) casts first, so an avatar is simply "a target that cannot be hurt
+// here" - the hit lands on that player's own machine, where the attack is mirrored.
+void OnGetTargetPlayerPost(hooks::CallInfo& ci) {
+    auto& s = S();
+    if (!s.active || !ci.object || !ci.result) return;
+    auto bi = s.byEnemy.find(ci.object);
+    if (bi == s.byEnemy.end() || !IsMine(bi->second)) return;
+    auto ei = s.entries.find(bi->second);
+    if (ei == s.entries.end()) return;
+    (void)ei;
+    if (SDK::ACharacter* proxy = RemoteTargetOf(ci.object)) *static_cast<SDK::AActor**>(ci.result) = proxy;
+}
+
+bool IsWhaleking(SDK::AEnemyBase_C* en) {
+    static std::unordered_map<const void*, bool> cache;
+    const void* cls = en->Class;
+    if (auto it = cache.find(cls); it != cache.end()) return it->second;
+    std::string n = ue::ClassName(en);
+    for (char& c : n) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    const bool whale = n.find("whaleking") != std::string::npos;
+    if (cache.size() > 256) cache.clear();
+    cache[cls] = whale;
+    return whale;
+}
+
 void ReplayAttack(Entry& e, SDK::AEnemyBase_C* en, int32_t idx, uint32_t seed) {
     auto& s = S();
-    if (TierOf(en) < kElite && !e.bossBar) {
-        PlayAttack(en, idx);
-        return;
-    }
-    WakeLocal(e, en, false, "attack");
+    // 1.0.6: ordinary enemies used to get the bare attack animation here. Their projectiles, shock waves and area
+    // effects are spawned by the attack Blueprint, so those existed only on the machine that ran the enemy: the
+    // other players saw the swing and nothing else. Every tier now runs its attack Blueprint (seeded, so random
+    // choices match), aimed at the player the owner's copy is attacking (see RemoteTargetOf).
+    if (TierOf(en) >= kElite || e.bossBar) WakeLocal(e, en, false, "attack");
+    // 1.0.5: the Whaleking's attack Blueprint starts with "phase change still due?". A follower's copy never ran the
+    // phase change itself (its HP is written from the owner's), so in phase 2 every replayed attack became the
+    // drop-into-the-arena slam with its arena-wide damage. Its attacks reach followers through the montage mirror.
+    if (IsWhaleking(en)) return;
     SDK::Params::FS_EnemyCharacterBase_BP_StartAttackState p{};
     p.AttackState = idx;
     ue::SeedGameRand(seed);
@@ -1981,6 +2717,7 @@ void CallBossBar(SDK::AEnemyBase_C* en, bool on) {
     if (!IsFsPlayer(ch)) return;
     SDK::Params::EnemyBase_C_Enemy_GetBossInfo bi{};
     Call(en, "Enemy_GetBossInfo", bi);
+    S().callingBossBar = true;
     if (on) {
         SDK::Params::FS_PlayerChar_C_ActivateBossHPBar p{};
         p.Enemy = en;
@@ -1992,6 +2729,7 @@ void CallBossBar(SDK::AEnemyBase_C* en, bool on) {
         p.Group = bi.Group__optional_;
         Call(ch, "DeactivateBossHPBar", p);
     }
+    S().callingBossBar = false;
 }
 
 // Snapshots are accepted only from the enemy's current owner.
@@ -2073,13 +2811,19 @@ void ApplyEvent(const net::MsgEnemyEvent& ev) {
         case net::EnemyEventType::AttackStart:
             if (en && !en->bDead && !IsMine(ev.enemyId) && !HasCustomAttacks(e, en)) {
                 TakeControl(e, en);
-                ReplayAttack(e, en, ev.arg, ev.seed);
+                e.followTarget = AttackTarget(ev.arg, ev.ownerSlot);
+                if (e.followTarget != s.localSlot) TargetProxy(e.followTarget, true);
+                ReplayAttack(e, en, AttackIndex(ev.arg), ev.seed);
             }
             break;
         case net::EnemyEventType::Woke:
             WakeLocal(e, en, ev.arg != 0, "remote Woke");
             break;
         case net::EnemyEventType::Interacted: {
+            if (s.isHost && ev.ownerSlot < net::kMaxPlayers) {
+                e.interactSlot = ev.ownerSlot;
+                e.interactAt = now;
+            }
             std::string who;
             if (ev.ownerSlot < net::kMaxPlayers) who = coop::Members()[ev.ownerSlot].name;
             if (who.empty()) who = "P" + std::to_string(ev.ownerSlot + 1);
@@ -2087,13 +2831,16 @@ void ApplyEvent(const net::MsgEnemyEvent& ev) {
             break;
         }
         case net::EnemyEventType::CustomAttack:
-            if (en && !en->bDead && !IsMine(ev.enemyId) && ev.arg >= 0 && ev.arg < kCustomAttackCount) {
+            if (const int32_t ca = AttackIndex(ev.arg);
+                en && !en->bDead && !IsMine(ev.enemyId) && ca >= 0 && ca < kCustomAttackCount) {
+                e.followTarget = AttackTarget(ev.arg, ev.ownerSlot);
+                if (e.followTarget != s.localSlot) TargetProxy(e.followTarget, true);
                 WakeLocal(e, en, false, "custom attack");
                 TakeControl(e, en);
                 e.customAttacks = true;
                 alignas(16) uint8_t parms[64] = {};   // DoNormalAttack / DoBigAttack take no parameters
                 s.replayingCustom = true;
-                Call(en, kCustomAttacks[ev.arg].name, parms);
+                Call(en, kCustomAttacks[ca].name, parms);
                 s.replayingCustom = false;
             }
             break;
@@ -2347,6 +3094,7 @@ void FollowerTick(double now) {
                 e.nextReconcileAt = now + kRespawnRetrySec;
             } else if (ownerDead && localAlive && e.ownerDeadSince >= 0 && now - e.ownerDeadSince >= kDeadGraceSec) {
                 e.diedSentFor = en;
+                QD_INFO(kTag, "{:016X} ({}): dead on its owner, removing our copy without rewards", e.id, ue::Name(en));
                 KillEnemy(en, true, true);   // dead on the owner without a Died event (e.g. before we joined)
                 e.nextReconcileAt = now + kKillRetrySec;
                 LogEvent(std::format("对齐：移除 {:04X}", ShortId(id)));
@@ -2355,7 +3103,10 @@ void FollowerTick(double now) {
         if (!localAlive || !fresh) continue;
         TakeControl(e, en);
         if (ownerDead) continue;
-        if ((last.flags & 16) == 0 && en->InTrapMode && e.wokenFor != en) WakeLocal(e, en, false, "owner's copy is up");
+        // Backstop for a rise we never heard of (it happened before we joined): only when the owner's copy is fighting.
+        // Without that condition a copy that merely differs (other save, not initialised yet) woke ours.
+        if ((last.flags & 16) == 0 && (last.flags & 4) != 0 && en->InTrapMode && e.wokenFor != en)
+            WakeLocal(e, en, false, "owner's copy is up");
         // the Woke / BossBarOn events are lost when our copy did not exist yet (spawned later, joined later);
         // the snapshot flags repeat them.
         if ((last.flags & 32) && e.wokenFor != en) WakeLocal(e, en, false, "owner's copy was started");
@@ -2395,6 +3146,9 @@ void BeginSession() {
         e.lastHitSlot = 0xFF;
         e.lastHitAt = -100;
         e.excludeSlot = 0xFF;
+        e.bossLockSlot = e.interactSlot = 0xFF;
+        for (double& t : e.hitAt) t = -100;
+        e.interactAt = -100;
         e.excludeUntil = 0;
         if (Valid(e.enemy) && e.enemy->bDead) e.diedSentFor = e.enemy;
     }
@@ -2424,6 +3178,7 @@ void EndSession(bool wasHost) {
     s.hpScale = net::MsgHpScale{};
     s.rescalePending = false;
     s.simulated = s.followed = s.controlledCount = 0;
+    DestroyTargetProxies();
     ApplyScaling("session end");   // MultFor() is 1 now (active == false) -> originals back, HP % kept
     RestoreAllData();              // also undoes ClientMatchMaxHp adjustments
     QD_INFO(kTag, "session ended ({}): released {} enemies", wasHost ? "host" : "client", released);
@@ -2514,6 +3269,8 @@ void Tick(float dt) {
         s.hostSpawnerResets.clear();
         s.shield.clear();
         s.cands.clear();
+        for (SDK::ACharacter*& ch : s.proxy) ch = nullptr;   // gone with the old world
+        s.remoteTargets = 0;
         s.world = world;
         s.rebuildAccum = kRebuildInterval;
         QD_INFO(kTag, "world changed -> {}; enemy map rebuilt from scratch", world ? ue::Name(world) : std::string("<none>"));
@@ -2560,6 +3317,8 @@ void Tick(float dt) {
             }
             SimTick(now, dt);
             FollowerTick(now);
+            UpdateTargetProxies();
+            RiseWatchTick(now);
         } else {
             s.simulated = s.followed = s.controlledCount = 0;
         }
@@ -2680,6 +3439,17 @@ void EnemySyncInit() {
     auto& ids = s.hookIds;
     // simulator (whoever owns the enemy)
     ids.push_back(hooks::AddPre(kFnStartAttackState, OnStartAttackPre));
+    ids.push_back(hooks::AddPost(kFnGetTargetPlayer, OnGetTargetPlayerPost));
+    if (!s.nativeTargetHooks) {
+        const bool a = hooks::AddNativePost("/Script/Engine.GameplayStatics:GetPlayerCharacter", OnNativeGetPlayer);
+        const bool b = hooks::AddNativePost("/Script/Engine.GameplayStatics:GetPlayerPawn", OnNativeGetPlayer);
+        s.nativeTargetHooks = a && b;
+    }
+    ids.push_back(hooks::AddPre(kFnEnterTrapMode, OnEnterTrapModePre));
+    ids.push_back(hooks::AddPost(kFnEnterTrapMode, OnEnterTrapModePost));
+    ids.push_back(hooks::AddPre(kFnActivateEnemyAI, OnActivateAiPre));
+    ids.push_back(hooks::AddPost(kFnActivateEnemyAI, OnActivateAiPost));
+    ids.push_back(hooks::AddPre(kFnActivateTrap, OnActivateTrapPre));
     ids.push_back(hooks::AddPost(kFnActivateTrap, OnActivateTrapPost));
     for (const char* fn : kInteractFns) ids.push_back(hooks::AddPost(fn, OnEnemyInteractPost));
     for (int i = 0; i < kCustomAttackCount; ++i) {
@@ -2776,6 +3546,13 @@ void DebugDescribe(Entry& e) {
             en->CurrentStateIndex, en->CurrentSubState, en->InTrapMode ? 1 : 0, en->bDead ? 1 : 0, e.controlled ? 1 : 0,
             en->bIsAIDisabled ? 1 : 0, IsBossLike(e, en) ? 1 : 0, e.bossBar ? 1 : 0, TierOf(en), p.X, p.Y, p.Z,
             Valid(m) ? ue::Name(m) : std::string("-"), blob.empty() ? std::string("-") : blob);
+    if (Valid(e.spawner)) {
+        auto* sp = static_cast<SDK::AEnemySpawner_C*>(e.spawner);
+        QD_INFO("edbg", "   spawner {} mode={} inActRange={} builtInTrigger={} spawnOnActivate={} noDmgTillTrap={} woken={} savedAiOff={}",
+                ue::Name(sp), static_cast<int>(sp->BehaviourMode), sp->PlayerIsInActivationRange ? 1 : 0,
+                sp->EnableBuiltInActivationTrigger ? 1 : 0, sp->SpawnOnActivate ? 1 : 0,
+                sp->DisableDamageTillTrapTriggered ? 1 : 0, e.wokenFor == en ? 1 : 0, e.savedAiDisabled ? 1 : 0);
+    }
     (void)s;
 }
 
@@ -2876,6 +3653,26 @@ void DebugEnemyWake(const std::string& filter) {
     SDK::Params::EnemyBase_C_ActivateTrap p{};
     Call(e->enemy, "ActivateTrap", p);
     QD_INFO("edbg", "wake {} (trap now {})", ue::ClassName(e->enemy), e->enemy->InTrapMode ? 1 : 0);
+}
+
+// Dev: how many actors of each class whose name contains `filter` exist right now (projectiles, area effects, ...).
+void DebugActorCount(const std::string& filter) {
+    const std::string f = Lower(filter);
+    static std::vector<SDK::AActor*> all;
+    all.clear();
+    ActorsOfClass(SDK::AActor::StaticClass(), all);
+    std::map<std::string, int> counts;
+    for (SDK::AActor* a : all) {
+        if (!Valid(a)) continue;
+        const std::string cls = ue::ClassName(a);
+        if (f.empty() || Lower(cls).find(f) != std::string::npos) ++counts[cls];
+    }
+    std::string line;
+    for (const auto& [cls, n] : counts) {
+        line += std::format("{} x{}, ", cls, n);
+        if (line.size() > 700) break;
+    }
+    QD_INFO("edbg", "actors '{}': {} class(es) of {} actors: {}", filter, counts.size(), all.size(), line);
 }
 
 void DebugEnemyInteract(const std::string& filter) {

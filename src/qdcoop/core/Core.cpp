@@ -1,5 +1,7 @@
 #include "qdcoop/core/Core.h"
 
+#include "qdcoop/core/EngineOffsets.h"
+
 #include "qdcoop/core/Config.h"
 #include "qdcoop/core/Guard.h"
 #include "qdcoop/core/Hooks.h"
@@ -98,6 +100,8 @@ void FlushReadyHandlers() {
 }
 
 DWORD WINAPI InitThread(LPVOID) {
+    // Game updates move the engine symbols the SDK headers hard-code; find them in this build first.
+    ResolveEngineOffsets();
     const uint64_t t0 = util::NowMs();
     Probe last = Probe::NoObjects;
     for (;;) {

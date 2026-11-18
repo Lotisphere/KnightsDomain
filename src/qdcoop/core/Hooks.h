@@ -53,6 +53,15 @@ void   Remove(HookId id);
 // sync features silently miss events. The UI warns the player.
 bool ScriptHooksComplete();
 
+// Native (C++) engine functions that Blueprints call directly, e.g. "/Script/Engine.GameplayStatics:GetPlayerCharacter".
+// Those never pass through ProcessEvent / ProcessInternal, so they are intercepted by swapping the function's native
+// entry (UFunction::Func). The callback runs on the game thread after the original, with the object whose script made
+// the call, the script function that made it, and the address of the return value. At most kMaxNativePosts functions;
+// the engine must be ready. False if the function was not found or its entry does not look like game code.
+constexpr int kMaxNativePosts = 4;
+using NativePostCallback = std::function<void(SDK::UObject* caller, SDK::UFunction* callerFunction, void* result)>;
+bool AddNativePost(const char* functionPath, NativePostCallback cb);
+
 // Debug: log every distinct function name seen for objects of this class name for N seconds (debugging aid).
 void TraceClass(const char* className, float seconds);
 

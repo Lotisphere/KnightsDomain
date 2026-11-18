@@ -8,7 +8,7 @@ Source code of the two DLLs that make up Knights' Domain. Release builds are pub
 | Path | Contents |
 | --- | --- |
 | `src/proxy` | Loader DLL. Forwards the XInput exports to the system library and loads the mod DLL from a worker thread. |
-| `src/qdcoop/core` | Start-up, configuration, logging, function hooks, game-thread task queue, engine helpers, Steam ownership check, updater. |
+| `src/qdcoop/core` | Start-up, configuration, logging, function hooks, game-thread task queue, engine helpers, run-time engine address lookup, Steam ownership check, updater. |
 | `src/qdcoop/net` | Session and peer liveness, wire protocol codec, Steam transport, UDP loopback transport for development. No engine dependency. |
 | `src/qdcoop/sync` | State replication built on the net layer: sampling, snapshots, interpolation, ownership hand-over. |
 | `src/qdcoop/ui` | Overlay rendering and input capture, menu pages, string tables (English, Chinese, Japanese). |
@@ -37,6 +37,15 @@ Requirements: Visual Studio 2022 with the C++ workload, CMake 3.25 or newer, and
 The build also needs C++ SDK headers for the game. They are not part of this repository. Pass their location with
 `QD_SDK` (the folder that contains `SDK.hpp` and the `SDK` directory); without it the build looks in `sdk/CppSDK`
 next to `src`.
+
+The mod finds the engine addresses at run time and writes them into the SDK's `Offsets` table, so that table has to
+be made of variables. Two edits in the SDK headers, once per set of headers:
+
+- `SDK/Basic.hpp`, namespace `Offsets`: change `constexpr int32` to `inline int32` for `GObjects`, `AppendString`,
+  `GNames`, `GWorld`, `ProcessEvent` and `FindFunctionChecked` (leave `ProcessEventIdx` as it is).
+- `SDK/Engine_functions.cpp`: change `if constexpr (Offsets::GWorld != 0)` to `if (Offsets::GWorld != 0)`.
+
+CMake stops with a message when the first edit is missing.
 
 ```
 cmake -S src -B build -G "Visual Studio 17 2022" -A x64 -DQD_SDK=<path to the SDK headers>
