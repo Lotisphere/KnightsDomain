@@ -8,6 +8,7 @@
 #include "qdcoop/ui/CoopMenu.h"
 #include "qdcoop/ui/I18n.h"
 #include "qdcoop/ui/Overlay.h"
+#include "qdcoop/ui/TitleButton.h"
 
 namespace qd::sync {
 namespace {
@@ -17,6 +18,7 @@ void StartWo3Modules() {
     if (!ui::Init()) QD_ERROR("bootstrap", "overlay init failed - continuing without the F5 menu / toasts");
     coop::Init();
     ui::InitCoopMenu();
+    ui::TitleButtonInit();
     PlayerSyncInit();
     QD_INFO("bootstrap", "player sync modules ready ({} {}, game build {})", core::kModName, core::kModVersion, core::GameBuild());
 }
