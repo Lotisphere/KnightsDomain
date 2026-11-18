@@ -15,6 +15,7 @@
 #include "SDK/FBAttributes_structs.hpp"
 
 #include "qdcoop/sync/HazardSync.h"
+#include "qdcoop/sync/WorldSync.h"
 
 #include "qdcoop/core/Core.h"
 #include "qdcoop/core/Hooks.h"
@@ -41,7 +42,7 @@ constexpr const char* kPickupClass = "/Game/Blueprints/CoreItemPickupActor.CoreI
 constexpr size_t kDropperOffset = 0x90;   // SpawnItemDrop_C_TrySpawningItem::Dropper
 constexpr size_t kLocationOffset = 0x70;  // SpawnItemDrop_C_TrySpawningItem::Location
 constexpr double kRollWindowSec = 4.0;     // a drop pickup this soon after a roll ...
-constexpr float  kRollRadiusCm = 900.0f;   // ... and this close to where it was rolled belongs to it
+constexpr float  kRollRadiusCm = 600.0f;   // ... and this close to where it was rolled belongs to it
 
 double NowSec() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 constexpr uint8_t kRefNone = 0, kRefEnemy = 1;
@@ -290,7 +291,13 @@ void ScanDrops(double now) {
     const auto slot = coop::LocalSlot();
     if (!slot) return;
     for (SDK::AActor* a : found) {
-        if (s.knownDrops.count(a) || !IsDropPickup(a)) continue;
+        if (s.knownDrops.count(a) || !ue::IsValid(a)) continue;
+        // spawned at run time: "<Class>_C_<number>". Pickups placed in a level ("Herb_Item_BP_2") that stream in
+        // near a kill are not its loot.
+        if (ue::Name(a).rfind(ue::Name(a->Class) + "_", 0) != 0) {
+            s.knownDrops[a] = true;
+            continue;
+        }
         const SDK::FVector at = a->K2_GetActorLocation();
         const State::Roll* best = nullptr;
         float bestD = kRollRadiusCm;
@@ -378,7 +385,8 @@ void SpawnRemote(const net::MsgHazard& m) {
         if (drop && !setGuid()) QD_WARN(kTag, "drop {} spawned without a GUID slot", m.classPath);
         if (drop) {
             // the owner's TrySpawningItem wrote its ItemDrops entry; ours was skipped, so the pickup writes it now
-            if (SDK::UFunction* fn = ue::FindFunction(a, "SaveDropData")) {
+            // (only drops the game saves: coins and pot loot are not kept in the save)
+            if (SDK::UFunction* fn = IsDropPickup(a) ? ue::FindFunction(a, "SaveDropData") : nullptr) {
                 alignas(16) uint8_t parms[64] = {};
                 ue::CallFunction(a, fn, parms);
             }
@@ -449,12 +457,25 @@ void HazardSyncInit() {
         static int logged = 0;
         if (logged++ < 40)
             QD_INFO(kTag, "loot roll by {} (enemy {:016X}, {})", valid ? ue::ClassName(dropper) : std::string("none"), id,
-                    id == 0 || EnemyOwnedHere(id) ? "rolled here and sent" : "skipped: the enemy's owner sends it");
+                    id != 0 && !EnemyOwnedHere(id)                                  ? "skipped: the enemy's owner sends it"
+                    : WorldSyncReplaying() || (valid && WorldSyncReplayedRecently(dropper, 15.0)) ? "skipped: broken by another player, who sends it"
+                                                                                                   : "rolled here and sent");
         // an enemy someone else runs: that machine rolls and sends it. Anything else (chests, pots ...) only rolls on
         // the machine where it was opened, and is sent from there.
         if (id != 0 && !EnemyOwnedHere(id)) return true;
+        // a pot broken on another machine: its drop comes from there (the roll comes at the end of the break
+        // animation, after the replay itself)
+        if (WorldSyncReplaying() || (valid && WorldSyncReplayedRecently(dropper, 15.0))) return true;
         const auto* loc = reinterpret_cast<const SDK::FVector*>(static_cast<uint8_t*>(ci.params) + kLocationOffset);
         st.rolls.push_back({NowSec(), id, *loc});
+        // pickups that exist before the roll are not its loot (coins and pot loot are not flagged as saved drops,
+        // so "new since the roll" is what tells them apart)
+        if (!ue::IsValid(st.pickupCls)) st.pickupCls = ue::FindClass(kPickupClass);
+        if (st.pickupCls) {
+            std::vector<SDK::AActor*> existing;
+            ActorsOfClass(st.pickupCls, existing);
+            for (SDK::AActor* a : existing) st.knownDrops[a] = true;
+        }
         return false;
     });
     if (!hooks::AddNativePost("/Script/Engine.GameplayStatics:FinishSpawningActor", &OnSpawned))

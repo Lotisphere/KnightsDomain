@@ -12,6 +12,8 @@
 //   g<32 hex>  savable actor state        n<name>  named save data        v<path>  save point visited
 //   t<path>    teleporter unlocked        c<path>  last touched checkpoint (value unused)   s<path>  save point id
 //   x<32 hex>  a loot drop was picked up (its ItemDrops entry went away): everyone removes it
+//   e<n>:<path> event, not state: Blueprint function kMirrored[n] ran on that level object here; every other machine
+//               runs it on its own copy (cutscenes, activation triggers). Never remembered or resent.
 // Loot drops themselves are spawned by HazardSync (the enemy's owner rolls them once).
 // Joining: the host sends its whole state (full = true). A client keeps quiet until that arrived, takes it, and then
 // sends only what the host does not have, so a client's older save never overwrites the host's world.
@@ -32,11 +34,13 @@
 #include "qdcoop/sync/WorldSync.h"
 
 #include "qdcoop/core/Core.h"
+#include "qdcoop/core/Hooks.h"
 #include "qdcoop/core/Log.h"
 #include "qdcoop/core/Unreal.h"
 #include "qdcoop/sync/Coop.h"
 
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -78,6 +82,10 @@ struct State {
     bool     pending = false;            // a received entry could not be written yet
     std::set<Guid> taken;                // loot drops picked up by anyone this session
     std::set<Guid> dropsSeen;            // ItemDrops keys at the last poll (same save object)
+    std::vector<std::string> eventsOut;  // mirrored events that ran here, sent by the ticker
+    double   quietUntil = 0;             // no mirrored events before this (a save or world is being restored)
+    bool replaying = false;              // inside a mirrored event received from another machine
+    std::unordered_map<const void*, double> replayed;   // objects a received event ran on, and when
 };
 State& S() {
     static State s;
@@ -371,6 +379,62 @@ bool ApplyEntry(SDK::UFS_SaveSlot_C* save, const std::string& name, int32_t valu
     }
 }
 
+// ------------------------------------------------------------------ mirrored events
+// Level objects placed in the map have the same path on every machine. These Blueprint functions only ever run on
+// the machine whose player caused them ("player 0" walked into the trigger, the boss the host runs died, the player
+// talked to an NPC); the others run them on their own copy. Their lasting results (one-shot flags, story counters)
+// are save data and travel the normal way.
+constexpr const char* kMirrored[] = {
+    // a trigger volume fires its targets: ambush spawners, gates, lifts, music, arena locks
+    "/Game/Blueprints/ActivationTrigger.ActivationTrigger_C:DoTrigger",
+    // a cutscene starts (ritual, Sipeha transition, the four endings): it plays for everyone
+    "/Game/Cutscenes/CutsceneManagerBase.CutsceneManagerBase_C:BeginCutscene",
+    // a pot breaks: pots are not saved (they come back after a rest), so the break itself is shared; its loot is
+    // rolled where it was broken and arrives as a drop (HazardSync skips the roll during a replay)
+    "/Game/Props/Pots/Pot_Base.Pot_Base_C:Break",
+};
+constexpr size_t kMirroredCount = sizeof(kMirrored) / sizeof(kMirrored[0]);
+
+std::string FunctionName(const char* path) {
+    const char* c = std::strrchr(path, ':');
+    return c ? std::string(c + 1) : std::string(path);
+}
+
+double NowSec() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
+void QueueEvent(size_t index, SDK::UObject* obj) {
+    auto& s = S();
+    if (s.replaying || !coop::InSession() || !obj || !ue::IsValid(obj)) return;
+    // while a save loads (death, joining) the game re-runs triggers to restore them: that is not a player's action
+    if (NowSec() < s.quietUntil || !ActiveSave() || !ue::LocalCharacter()) return;
+    const std::string path = ue::PathName(obj);
+    if (path.empty() || path.size() > 400) return;
+    s.eventsOut.push_back("e" + std::to_string(index) + ":" + path);
+}
+
+// Runs an event received from another machine on our copy of the object.
+void RunEvent(const std::string& key) {
+    auto& s = S();
+    const size_t colon = key.find(':');
+    if (key.size() < 4 || key[0] != 'e' || colon == std::string::npos) return;
+    const size_t index = static_cast<size_t>(std::atoi(key.substr(1, colon - 1).c_str()));
+    if (index >= kMirroredCount) return;
+    const std::string path = key.substr(colon + 1);
+    SDK::UObject* obj = ue::FindObject(path);
+    if (!obj || !ue::IsValid(obj)) {
+        QD_INFO(kTag, "event {} for {}: not loaded here, skipped", FunctionName(kMirrored[index]), path);
+        return;
+    }
+    SDK::UFunction* fn = ue::FindFunction(obj, FunctionName(kMirrored[index]));
+    if (!fn) return;
+    alignas(16) uint8_t parms[512] = {};   // DoTrigger has none; BeginCutscene's "Ended" delegate stays unbound
+    s.replaying = true;
+    s.replayed[obj] = NowSec();
+    ue::CallFunction(obj, fn, parms);
+    s.replaying = false;
+    QD_INFO(kTag, "ran {} on {}", FunctionName(kMirrored[index]), path);
+}
+
 // ------------------------------------------------------------------ diff / send
 
 void Flags(const Snapshot& from, const Snapshot* minus, std::vector<net::FlagValue>& out) {
@@ -472,6 +536,10 @@ void OnWorldFlags(uint8_t fromSlot, const uint8_t* data, size_t size) {
     if (save) RebuildIndex();
     int applied = 0;
     for (auto& f : m.flags) {
+        if (!f.name.empty() && f.name[0] == 'e') {   // an event: run it once, never remembered
+            RunEvent(f.name);
+            continue;
+        }
         Remember(s.known, f.name, f.value);   // even when it cannot be written now: Reassert catches up
         if (save && ApplyEntry(save, f.name, f.value)) ++applied;
         else s.pending = true;
@@ -502,7 +570,17 @@ bool SyncSessionFlag() {
 
 void Tick(float dt) {
     auto& s = S();
-    if (!SyncSessionFlag()) return;
+    if (!SyncSessionFlag()) {
+        s.eventsOut.clear();
+        return;
+    }
+    if (!s.eventsOut.empty()) {
+        std::vector<net::FlagValue> ev;
+        for (auto& e : s.eventsOut) ev.push_back({e, 0});
+        s.eventsOut.clear();
+        SendChunks(ev, false, [](const std::vector<uint8_t>& b) { coop::Broadcast(net::Channel::Reliable, b); });
+        QD_INFO(kTag, "sent {} event(s), first {}", ev.size(), ev.front().name);
+    }
     s.pollIn -= dt;
     s.indexIn -= dt;
     if (s.pollIn > 0) return;
@@ -513,6 +591,7 @@ void Tick(float dt) {
     const bool host = coop::IsHost();
     SDK::UWorld* world = ue::World();
     const bool reloaded = save != s.lastSave || world != s.lastWorld;
+    if (reloaded) s.quietUntil = NowSec() + 5.0;
     const bool reindexed = s.indexIn <= 0 || reloaded;
     if (reindexed) {
         s.indexIn = kIndexSec;
@@ -572,12 +651,27 @@ void OnMember(const coop::Member& m, bool joined) {
 
 }  // namespace
 
+bool WorldSyncReplaying() { return S().replaying; }
+
+bool WorldSyncReplayedRecently(const void* obj, double seconds) {
+    auto& s = S();
+    const double now = NowSec();
+    std::erase_if(s.replayed, [&](const auto& kv) { return now - kv.second > 60.0; });
+    auto it = s.replayed.find(obj);
+    return it != s.replayed.end() && now - it->second <= seconds;
+}
+
 void WorldSyncInit() {
     auto& s = S();
     if (s.inited) return;
     s.inited = true;
     coop::On(net::MsgType::WorldFlags, &OnWorldFlags);
     coop::AddMemberListener(&OnMember);
+    for (size_t i = 0; i < kMirroredCount; ++i)
+        hooks::AddPre(kMirrored[i], [i](hooks::CallInfo& ci) {
+            QueueEvent(i, ci.object);
+            return false;
+        });
     s.ticker = gamethread::AddTicker("worldsync", [](float dt) { Tick(dt); });
     QD_INFO(kTag, "initialized");
 }
